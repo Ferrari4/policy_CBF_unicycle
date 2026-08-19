@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+Results/
+check.py
+*.png
+.vscode/
+*.egg-info/
