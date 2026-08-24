@@ -51,7 +51,7 @@ class noise_test_sampler:
         self._held = None
         self._interval = None
 
-    def zero_test(self, rng, x, k):
+    def zero_test(self, rng, x, k, scale):
         return np.zeros(self.nd)
 
     def uniform_test(self, rng, x, k, scale=1.0):

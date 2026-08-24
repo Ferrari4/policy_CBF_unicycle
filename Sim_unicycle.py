@@ -23,10 +23,9 @@ Input handling in simulate():
     - u as array-like of shape (N, 2)       -> per-step input sequence, horizon = N * dt
     - u as callable u(t, state) -> (v, w)   -> feedback / time-varying policy (needs T)
 """
-
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-
 
 class UnicycleSim:
     def __init__(self, dt=0.01, integrator=None):
@@ -256,21 +255,7 @@ class UnicycleSim:
     def plot_external_trajectories(self, states_list, inputs_list, labels=None,
                                    dt=None, robot_size=0.15, triangle_every=None,
                                    title="Unicycle trajectories", show=True):
-        """
-        Plot externally supplied state trajectories (XY figure) and input
-        signals (v / omega vs time figure).
 
-        states_list : one trajectory of shape (N+1, 3), or a list of them
-        inputs_list : one input history of shape (N, 2), or a list of them.
-                      Length N+1 (one input per state) is also accepted;
-                      the trailing input is dropped with a warning.
-        labels      : str or list of str, optional
-        dt          : timestep used to build the input time axis. Defaults to
-                      self.dt -- pass explicitly if the external data was
-                      generated with a different step.
-
-        Returns (ax_traj, (ax_v, ax_omega)).
-        """
         states_list = self._as_traj_list(states_list, "states_list", 3)
         inputs_list = self._as_traj_list(inputs_list, "inputs_list", 2)
 
@@ -381,6 +366,23 @@ class UnicycleSim:
         fig_traj.tight_layout()
         fig_u.tight_layout()
 
+        # ---------------- save figures ----------------
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Results")
+        os.makedirs(results_dir, exist_ok=True)
+
+        fig_traj.savefig(
+            os.path.join(results_dir, "trajectory_plot.png"),
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        fig_u.savefig(
+            os.path.join(results_dir, "inputs_plot.png"),
+            dpi=300,
+            bbox_inches="tight"
+        )
+
         if show:
             plt.show()
+
         return ax_traj, (ax_v, ax_omega)
