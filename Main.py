@@ -23,10 +23,10 @@ class policy_filter:
         self.T_rollout   = 1.5      # s, certificate lookahead
         self.T_dstb_hold = 0.3      # s, piecewise-constant disturbance interval
         self.T_sim       = 100.0    # s, sim length
-        self.dt          = 0.005     # s, sim step size
+        self.dt          = 0.005    # s, sim step size
 
         # General parameters
-        self.barrier_inflate = 0.03 # margin for safety (to avoid numerical issues)
+        self.barrier_inflate = 0.0 # margin for safety (to avoid numerical issues)
         self.v_max = 1.0            # m/s, max linear velocity
         self.om_max = 3.0           # rad/s, max angular velocity
         self.goal = np.array([4.0, 4.0]) # goal position in the plane in meters [x,y]
@@ -293,6 +293,7 @@ def plot_mesh(out, traj=None, path=None):
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
+    
 def main_RP_CBF_QP():
     x_s = np.array([0.5, 2.5, 0.0])
     safety = policy_filter(controller="proportional_policy", 
@@ -617,7 +618,7 @@ def main_P_CLF_QP():
     print("saved pclf_history.png")
 
 if __name__ == "__main__":
-    option = 4
+    option = 1
     if option == 1:
         main_RP_CBF_QP()
     elif option == 2:

@@ -5,3 +5,4 @@ check.py
 *.png
 .vscode/
 *.egg-info/
+*.json

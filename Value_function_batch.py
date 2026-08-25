@@ -5,19 +5,18 @@ from Value_function import h_certificate
 from Dynamics import sys_dynm_dd
 from Control_policy import policy
 from Noise_sampler import noise_train_sampler
-
 class h_certificate_batch:
     def __init__(self, dynamic_class: sys_dynm_dd,
                  obs_pos, R_O, hcert_class: h_certificate,
                  policy_h="policy_h", policy_name="proportional_policy",
                  ivp_method="manual_RK4", delta=0.3):
 
-        assert ivp_method in ["manual_RK4"], "ivp_method should be 'manual_RK4' for batch"
+        assert ivp_method in ["manual_RK4"], "ivp_method should be 'manual_RK4' for batch processing"
         self.sys_dynm = dynamic_class
         self.hcert_class = hcert_class
         self.v_max = self.sys_dynm.controller.v_max
         self.om_max = self.sys_dynm.controller.om_max
-        self.nx = self.sys_dynm.nx          # state dimension [px, py, th]
+        self.nx = self.sys_dynm.nx          
         self.nu = self.sys_dynm.nu
         self.nd = self.sys_dynm.nd
 
@@ -35,38 +34,6 @@ class h_certificate_batch:
         # silent, so pin the parameters that define it.
         assert self.delta == self.hcert_class.delta, "delta mismatch vs hcert_class"
         assert self.policy_h == self.hcert_class.policy_h, "policy_h mismatch vs hcert_class"
-
-    # ---------------- batched policies ----------------
-    def policy_batch(self, bx):
-        """bx: (B, nx) -> (B, nu)."""
-        ctrl = self.sys_dynm.controller
-        px, py, th = bx[:, 0], bx[:, 1], bx[:, 2]
-
-        if self.policy_name == "proportional_policy":
-            kpw = 2.0
-            dx, dy = ctrl.goal[0] - px, ctrl.goal[1] - py
-            th_goal = np.arctan2(dy, dx)
-            th_err = np.arctan2(np.sin(th_goal - th), np.cos(th_goal - th))
-            v = ctrl.v_max * np.tanh(np.hypot(dx, dy))
-            om = np.clip(kpw * th_err, -ctrl.om_max, ctrl.om_max)
-            return np.stack([v, om], axis=1)
-
-        elif self.policy_name == "constant_policy":
-            return np.tile(np.array([0.5, 0.0]), (bx.shape[0], 1))
-
-        elif self.policy_name == "backup_policy":
-            B = bx.shape[0]
-            diff = bx[:, None, :2] - ctrl.obs_pos[None, :, :]     # (B, n_obs, 2)
-            dists = np.linalg.norm(diff, axis=2)                  # (B, n_obs)
-            i = np.argmin(dists, axis=1)                          # closest obstacle
-            b = np.arange(B)
-            n = diff[b, i] / dists[b, i][:, None]                 # outward normal
-            r = np.stack([-np.sin(th), np.cos(th)], axis=1)       # heading-perp
-            om_b = ctrl.om_max * np.tanh(np.einsum("ij,ij->i", n, r) / ctrl.eps)
-            return np.stack([np.full(B, ctrl.v_max), om_b], axis=1)
-
-        else:
-            raise ValueError(f"Unknown policy: {self.policy_name}")
 
     # ---------------- batched RK4 rollout ----------------
     def dynamics_batch(self, bx, bu, bd):
