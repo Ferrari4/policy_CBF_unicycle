@@ -51,13 +51,13 @@ class noise_test_sampler:
         self._held = np.zeros(self.nd)
         self._interval = None
 
-    def zero_test(self, rng, x, k, scale):
+    def zero_test(self):
         return np.zeros(self.nd)
 
-    def uniform_test(self, rng, x, k, scale=1.0):
+    def uniform_test(self, rng, scale=1.0):
         return rng.uniform(-scale, scale, size=(self.nd,))
 
-    def bangbang_test(self, rng, x, k, interval_size=1, scale=1.0):
+    def bangbang_test(self, rng, k, interval_size=1, scale=1.0):
         interval = k // interval_size
         if interval != self._interval:
             self._held = rng.choice([-scale, scale], size=(self.nd,))
@@ -74,9 +74,9 @@ class noise_test_sampler:
 
 if __name__ == "__main__":
     sampler = noise_test_sampler(nd=2)
-    uniform_noise = sampler.uniform_test(rng=sampler.rng, x=None, k=0, scale=1.0)
-    bangbang_noise = sampler.bangbang_test(rng=sampler.rng, x=None, k=0, interval_size=1, scale=1.0)
-    zero_test_noise = sampler.zero_test(rng=sampler.rng, x=None, k=0, scale=1.0)
+    uniform_noise = sampler.uniform_test(rng=sampler.rng, scale=1.0)
+    bangbang_noise = sampler.bangbang_test(rng=sampler.rng, k=0, interval_size=1, scale=1.0)
+    zero_test_noise = sampler.zero_test()
     sampler.set_worst(d0=[-1.0, 3.0])
     worst_noise = sampler.worst_case(rng=sampler.rng, x=None, k=0)
     print("-------------TEST NOISE SAMPLER-------------")
