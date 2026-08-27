@@ -1,34 +1,21 @@
-import time
 import numpy as np
-import quadprog
-
 from Dynamics import sys_dynm_dd
-from Control_policy import policy
 
 class v_certificate:
-    def __init__(self ,dynamic_class: sys_dynm_dd, policy_name="constant_policy",alpha=1.0,
-                 goal = np.array([4.5,4.5]), ivp_method="manual_RK4", 
-                 v_max=1.0 ,om_max=2.0 ,slack=False):
-
+    def __init__(self ,dynamic_class: sys_dynm_dd,
+                 policy_name="constant_policy", 
+                 goal = np.array([4.5,4.5])):
+        
         self.sys_dynm = dynamic_class
-        self.use_slack = slack
-        self.slack_weight = 100
-        self.alpha = alpha
-        self.gamma = 0.2 # For CLF
-        self.k = 1.0
-        self.v_max = v_max
-        self.om_max = om_max
-        self.inter_input = 1e-3
-
-        self.nx = self.sys_dynm.nx          
-        self.goal = goal
-        self.nV = 1                        
+        self.nx = self.sys_dynm.nx
         self.policy_name = policy_name
-        self.ivp_method = ivp_method
-  
-    def clf_value(self, x, goal):
+        self.goal = goal 
+        self.k = 1.0
+        self.nV = 1  
+
+    def get_params(self, x):
         px, py, theta = x
-        px_goal, py_goal = goal
+        px_goal, py_goal = self.goal
         dx = px - px_goal
         dy = py - py_goal
         d = np.sqrt(dx**2 + dy**2)
@@ -38,29 +25,22 @@ class v_certificate:
             np.sin(theta_goal - theta),
             np.cos(theta_goal - theta)
         )
-        # CLF
-        V = d**2 * (0.5 + self.k * (1.0 - np.cos(theta_err)))
+        return dx, dy, d, theta_err
+
+    def clf_value(self, x):
+        _, _, d, theta_err = self.get_params(x)
+        V = d**2 * (0.5 + self.k * (1.0 - np.cos(theta_err))) # CLF
         return V
 
-    def clf_value_gradient(self, x, goal):
-        px, py, theta = x
-        px_goal, py_goal = goal
-        dx = px - px_goal
-        dy = py - py_goal
-        d2 = dx**2 + dy**2
-        theta_goal = np.arctan2(py_goal - py, px_goal - px)
-        # Wrapped heading error [-pi, pi]
-        theta_err = np.arctan2(
-            np.sin(theta_goal - theta),
-            np.cos(theta_goal - theta)
-        )
+    def clf_value_gradient(self, x):
+        dx, dy, d, theta_err = self.get_params(x)
         sin_err = np.sin(theta_err)
         cos_err = np.cos(theta_err)
         A = 0.5 + self.k * (1.0 - cos_err)
         # Analytical gradient
         dV_dpx = 2.0 * dx * A - self.k * dy * sin_err
         dV_dpy = 2.0 * dy * A + self.k * dx * sin_err
-        dV_dtheta = -self.k * d2 * sin_err
+        dV_dtheta = -self.k * (d**2) * sin_err
         grad_V = np.array([
             dV_dpx,
             dV_dpy,
@@ -68,19 +48,8 @@ class v_certificate:
         ])
         return grad_V
 
-    def clf_certficate(self, x, goal=None):
-        goal = self.goal if goal is None else goal
-        px, py, theta = x
-        px_goal, py_goal = goal
-        dx = px - px_goal
-        dy = py - py_goal
-        d = np.sqrt(dx**2 + dy**2)
-        theta_goal = np.arctan2(py_goal - py, px_goal - px)
-        # Wrapped heading error [-pi, pi]
-        theta_err = np.arctan2(
-            np.sin(theta_goal - theta),
-            np.cos(theta_goal - theta)
-        )
+    def clf_certificate(self, x):
+        _, _, d, theta_err = self.get_params(x)
         V = 0.5 * d**2 + self.k * (1.0 - np.cos(theta_err))
         return np.array([V])
 
@@ -90,13 +59,12 @@ class v_certificate:
         if trajectory.shape[1] != self.nx:
             raise ValueError(f"Expected state dimension {self.nx}, got {trajectory.shape[1]}")
 
-        return np.stack([self.clf_certficate(state) for state in trajectory], axis=0)
+        return np.stack([self.clf_certificate(state) for state in trajectory], axis=0)
 
     def aggregate_v(self, t_values, v_values):
         return np.max(v_values, axis=0)
 
     def compute_v_vmax(self, x0, bH_dstb, include_v0=True):
-
         x0 = self.sys_dynm.chk_x(x0)
         bH_dstb = np.asarray(bH_dstb, dtype=float)
         if bH_dstb.ndim != 3:
@@ -104,20 +72,19 @@ class v_certificate:
         n_samples, horizon, nd = bH_dstb.shape
         if nd != self.sys_dynm.nd:
             raise ValueError(f"Expected disturbance dimension " f"{self.sys_dynm.nd}, got {nd}")
-
         sample_vmax = []
         trajectories = []
         value_histories = []
-
         for H_dstb in bH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name, method=self.ivp_method)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            if self.sys_dynm.process == "batch":
+                assert trajectory.shape[1] == 1
+                trajectory = trajectory[:, 0, :]
             v_history = self.evaluate_v_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (v_history.shape[0] - 1), v_history.shape[0])
             v_values = v_history if include_v0 else v_history[1:]
             t_values = t_history if include_v0 else t_history[1:]
-
             v_agg = self.aggregate_v(t_values, v_values)
-
             trajectories.append(trajectory)
             value_histories.append(v_history)
             sample_vmax.append(v_agg)
@@ -155,7 +122,10 @@ class v_certificate:
     def compute_v_diag(self, x0, vH_dstb, include_v0=True):
         v_out = np.zeros(self.nV)
         for j, H_dstb in enumerate(vH_dstb):
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name, method=self.ivp_method)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            if self.sys_dynm.process == "batch":
+                assert trajectory.shape[1] == 1
+                trajectory = trajectory[:, 0, :]
             v_history = self.evaluate_v_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (v_history.shape[0] - 1), v_history.shape[0])
             v_values = v_history if include_v0 else v_history[1:]
@@ -181,196 +151,121 @@ class v_certificate:
 
         return v_vmax, vH_dstb, grad_v_vmax, v_f, v_G, info
 
-    def solve_pclf_qp(self, u_nom, V, grad_V, f_x, g_x):
-        start_time = time.perf_counter()
-        nu = self.sys_dynm.nu
-        n_z = nu + 1 if self.use_slack else nu      # z = [v, om, (delta)]
 
-        M = np.eye(n_z)
-        if self.use_slack:
-            M[nu, nu] = self.slack_weight
-        q = np.zeros(n_z)
-        q[:nu] = np.asarray(u_nom, dtype=float)
+if __name__ == "__main__":
 
-        def pad(row):
-            return list(row) + ([0.0] if self.use_slack else [])
+    from Control_policy import policy
+    from Noise_sampler import noise_train_sampler
 
-        G = [pad([1.0, 0.0]), pad([-1.0, 0.0]),
-            pad([0.0, 1.0]), pad([0.0, -1.0])]
-        HG = [0.0, -self.v_max, -self.om_max, -self.om_max]
+    x0 = np.array([1.0, 1.5, np.pi / 4])
+    goal = np.array([4.5, 4.5])
 
-        # P-CLF row (SOFT when slack on): Vdot <= -gamma*V + delta
-        LfV = grad_V @ f_x
-        LGV = grad_V @ g_x
-        G.append(list(-LGV) + ([1.0] if self.use_slack else []))
-        HG.append(LfV + self.gamma * V)
+    # ---------------------------------------------------------
+    # Single dynamics object
+    # ---------------------------------------------------------
+    pol_single = policy(process="batch")
 
-        if self.use_slack:
-            G.append([0.0] * nu + [1.0])
-            HG.append(0.0)
+    dynm_single = sys_dynm_dd(
+        policy_class=pol_single,
+        dt=0.05,
+        ivp_method="manual_RK4",
+        process="batch"
+    )
 
-        try:
-            qp_sol = quadprog.solve_qp(M, q, np.array(G, dtype=float).T,
-                                    np.array(HG, dtype=float), 0)
-            u_act = qp_sol[0][:nu]
-            delta = qp_sol[0][nu] if self.use_slack else 0.0
-        except Exception as e:
-            print("QP failed:", e)
-            u_act = np.array([np.clip(u_nom[0], 0.0, self.v_max),
-                            np.clip(u_nom[1], -self.om_max, self.om_max)])
-            intervening = "infeasible"
-            solve_dt = time.perf_counter() - start_time
-            return u_act, intervening, solve_dt, V, 0.0
+    cert = v_certificate(
+        dynamic_class=dynm_single,
+        policy_name="constant_policy",
+        goal=goal
+    )
 
-        if np.linalg.norm(u_act - u_nom) >= self.inter_input:
-            intervening = True
-        else:
-            intervening = False
+    # ---------------------------------------------------------
+    # Direct CLF functions
+    # ---------------------------------------------------------
+    print("========== DIRECT CLF ==========")
 
-        solve_dt = time.perf_counter() - start_time
-        return u_act, intervening, solve_dt, V, delta
+    V = cert.clf_value(x0)
+    gradV = cert.clf_value_gradient(x0)
+    V_cert = cert.clf_certificate(x0)
 
-    def solve_clf_qp(self, u_nom, x, goal):
-        start_time = time.perf_counter()
+    print("clf_value      :", V)
+    print("clf_gradient   :", gradV)
+    print("clf_certificate:", V_cert)
 
-        V = self.clf_value(x, goal)
-        grad_V = self.clf_value_gradient(x, goal)
-        f_x = self.sys_dynm.f(x, [0, 0, 0])
-        g_x = self.sys_dynm.G(x, [0, 0, 0])
+    assert np.isscalar(V)
+    assert gradV.shape == (dynm_single.nx,)
+    assert V_cert.shape == (1,)
 
-        nu = self.sys_dynm.nu
-        n_z = nu + 1 if self.use_slack else nu      # z = [v, om, (delta)]
+    # ---------------------------------------------------------
+    # Disturbance samples
+    # ---------------------------------------------------------
+    noise = noise_train_sampler(
+        nd=dynm_single.nd,
+        rng=np.random.default_rng(42)
+    )
 
-        # Objective: 0.5*||u - u_nom||^2 + 0.5*slack_weight*delta^2
-        M = np.eye(n_z)
-        if self.use_slack:
-            M[nu, nu] = self.slack_weight           # e.g. 100.0
-        q = np.zeros(n_z)
-        q[:nu] = np.asarray(u_nom, dtype=float)
+    bH_dstb, _ = noise.bangbang_uniform_train(
+        n_samples=20,
+        n_samples_uniform=10,
+        horizon=20,
+        interval_size=5,
+        scale=0.1
+    )
 
-        def pad(row):
-            # hard constraints get a 0 in the slack column
-            return list(row) + ([0.0] if self.use_slack else [])
+    # ---------------------------------------------------------
+    # Value rollout
+    # ---------------------------------------------------------
+    print("\n========== VALUE ROLLOUT ==========")
 
-        # Input box: 0 <= v <= v_max, |om| <= om_max
-        # (swap for the wheel-diamond |v|/v_max + |om|/om_max <= 1 later)
-        G = [pad([1.0, 0.0]), pad([-1.0, 0.0]),
-            pad([0.0, 1.0]), pad([0.0, -1.0])]
-        HG = [0.0, -self.v_max, -self.om_max, -self.om_max]
+    v_vmax, vH_dstb, grad_v_vmax, v_f, v_G, info = \
+        cert.get_value_and_grad(
+            x0,
+            bH_dstb,
+            include_v0=True
+        )
 
-        # CLF row (SOFT when slack on): Vdot <= -gamma*V + delta
-        #   =>  -LGV @ u + delta >= LfV + gamma*V
-        LfV = grad_V @ f_x                          # = 0 for the unicycle (drift-free)
-        LGV = grad_V @ g_x
-        G.append(list(-LGV) + ([1.0] if self.use_slack else []))
-        HG.append(LfV + self.gamma * V)
+    print("v_vmax:\n", v_vmax)
+    print("vH_dstb shape:", vH_dstb.shape)
+    print("grad_v_vmax:\n", grad_v_vmax)
+    print("v_f shape:", v_f.shape)
+    print("v_G shape:", v_G.shape)
 
-        # delta >= 0
-        if self.use_slack:
-            G.append([0.0] * nu + [1.0])
-            HG.append(0.0)
+    print("\nInternal shapes:")
+    print("bHp1_x  :", info["bHp1_x"].shape)
+    print("bHp1v_v :", info["bHp1v_v"].shape)
+    print("bv_vmax :", info["bv_vmax"].shape)
+    print("v_argmax:", info["v_argmax"].shape)
 
-        try:
-            qp_sol = quadprog.solve_qp(M, q, np.array(G, dtype=float).T,
-                                    np.array(HG, dtype=float), 0)
-            u_act = qp_sol[0][:nu]
-            delta = qp_sol[0][nu] if self.use_slack else 0.0
+    # ---------------------------------------------------------
+    # Basic shape checks
+    # ---------------------------------------------------------
+    n_samples, horizon, _ = bH_dstb.shape
 
-        except Exception as e:
-            print("QP failed:", e)
-            u_act = np.array([np.clip(u_nom[0], 0.0, self.v_max),
-                            np.clip(u_nom[1], -self.om_max, self.om_max)])
-            intervening = "infeasible"
-            solve_dt = time.perf_counter() - start_time
-            return u_act, intervening, solve_dt, V, 0.0
+    assert v_vmax.shape == (cert.nV,)
+    assert vH_dstb.shape == (cert.nV, horizon, dynm_single.nd)
+    assert grad_v_vmax.shape == (cert.nV, dynm_single.nx)
+    assert v_f.shape == (cert.nV, dynm_single.nx)
+    assert v_G.shape == (
+        cert.nV,
+        dynm_single.nx,
+        dynm_single.nu
+    )
 
-        if np.linalg.norm(u_act - u_nom) >= self.inter_input:
-            intervening = True
-        else:
-            intervening = False
+    assert info["bHp1_x"].shape == (
+        n_samples,
+        horizon + 1,
+        dynm_single.nx
+    )
 
-        solve_dt = time.perf_counter() - start_time
-        return u_act, intervening, solve_dt, V, delta
+    assert info["bHp1v_v"].shape == (
+        n_samples,
+        horizon + 1,
+        cert.nV
+    )
 
-    def solve_clf_cbf_qp(self, u_nom, x, goal, h_hmax, grad_h_hmax, h_f, h_G):
-        """
-        Combined QP for result set two:
-        - CBF rows HARD    : hdot <= -alpha*h        (h <= 0 safe, RPCBF convention)
-        - CLF row  SOFT    : Vdot <= -gamma*V + delta (when use_slack)
-        """
+    assert info["bv_vmax"].shape == (
+        n_samples,
+        cert.nV
+    )
 
-        start_time = time.perf_counter()
-        V = self.clf_value(x, goal)
-        grad_V = self.clf_value_gradient(x, goal)
-        f_x = self.sys_dynm.f(x, [0,0,0])  # nominal model in the controller
-        g_x = self.sys_dynm.G(x, [0,0,0])
-
-        nu = self.sys_dynm.nu
-        n_z = nu + 1 if self.use_slack else nu      # z = [v, om, (delta)]
-
-        # Objective: 0.5*||u - u_nom||^2 + 0.5*slack_weight*delta^2
-        M = np.eye(n_z)
-        if self.use_slack:
-            M[nu, nu] = self.slack_weight
-        q = np.zeros(n_z)
-        q[:nu] = np.asarray(u_nom, dtype=float)
-
-        def pad(row):
-            # hard constraints get a 0 in the slack column
-            return list(row) + ([0.0] if self.use_slack else [])
-
-        # Input box: 0 <= v <= v_max, |om| <= om_max
-        G = [pad([1.0, 0.0]), pad([-1.0, 0.0]),
-            pad([0.0, 1.0]), pad([0.0, -1.0])]
-        HG = [0.0, -self.v_max, -self.om_max, -self.om_max]
-
-        # CBF rows (HARD): hdot <= -alpha*h
-        #   =>  -LGH @ u >= LfH + alpha*h
-        for j in range(len(h_hmax)):
-            LfH = grad_h_hmax[j] @ h_f[j]
-            LGH = grad_h_hmax[j] @ h_G[j]
-            G.append(pad(list(-LGH)))
-            HG.append(LfH + self.alpha * h_hmax[j])
-
-        # CLF row (SOFT when slack on): Vdot <= -gamma*V + delta
-        #   =>  -LGV @ u + delta >= LfV + gamma*V
-        LfV = grad_V @ f_x
-        LGV = grad_V @ g_x
-        G.append(list(-LGV) + ([1.0] if self.use_slack else []))
-        HG.append(LfV + self.gamma * V)
-
-        # delta >= 0
-        if self.use_slack:
-            G.append([0.0] * nu + [1.0])
-            HG.append(0.0)
-
-        try:
-            qp_sol = quadprog.solve_qp(M, q, np.array(G, dtype=float).T,
-                                    np.array(HG, dtype=float), 0)
-            u_act = qp_sol[0][:nu]
-            delta = qp_sol[0][nu] if self.use_slack else 0.0
-
-        except Exception as e:
-            print("QP failed:", e)
-            if len(h_hmax) > 0:
-                j = int(np.argmax(h_hmax))
-                LGH = grad_h_hmax[j] @ h_G[j]
-                u_lim = np.array([self.v_max, self.om_max])
-                u_act = np.clip(-np.sign(LGH) * u_lim, -u_lim, u_lim)
-                u_act[0] = np.clip(u_act[0], 0.0, self.v_max)
-            else:   # no barriers passed -> degenerate to CLF-only fallback
-                u_act = np.array([np.clip(u_nom[0], 0.0, self.v_max),
-                                np.clip(u_nom[1], -self.om_max, self.om_max)])
-            intervening = "infeasible"
-            solve_dt = time.perf_counter() - start_time
-            return u_act, intervening, solve_dt, h_hmax, V, 0.0
-
-        if np.linalg.norm(u_act - u_nom) >= self.inter_input:
-            intervening = True
-        else:
-            intervening = False
-
-        solve_dt = time.perf_counter() - start_time
-        return u_act, intervening, solve_dt, h_hmax, V, delta
-
-    
+    print("\n========== RESULT ==========")
+    print("v_certificate test: PASS")

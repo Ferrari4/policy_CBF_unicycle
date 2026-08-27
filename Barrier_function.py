@@ -7,24 +7,20 @@ from Noise_sampler import noise_train_sampler
 
 class h_certificate:
     def __init__(self, dynamic_class: sys_dynm_dd, obs_pos, R_O,
-                 policy_h="policy_h", policy_name="proportional_policy",
-                 ivp_method="manual_RK4", delta=0.3):
+                 policy_h="policy_h", policy_name="proportional_policy", delta=0.3):
 
         self.sys_dynm = dynamic_class
         self.v_max = self.sys_dynm.controller.v_max
         self.om_max = self.sys_dynm.controller.om_max
         self.nx = self.sys_dynm.nx          # state dimension [px, py, th]
-
         self.obs_pos = np.asarray(obs_pos, dtype=float).reshape(-1, 2)
         self.R_O = np.atleast_1d(np.asarray(R_O, dtype=float))
         assert self.obs_pos.shape[0] == self.R_O.shape[0]
         self.nh = self.R_O.shape[0]         # one barrier per obstacle
         self.delta = delta                  # heading inflation term
-
         self.policy_h = policy_h            # "policy_h" | "backup_h" | "mixed_h"
         self.policy_name = policy_name
-        self.ivp_method = ivp_method
-
+     
     # Convention: h > 0 unsafe, safe set = {h <= 0}
     def h_function(self, state):
         state = self.sys_dynm.chk_x(state)
@@ -73,7 +69,7 @@ class h_certificate:
             return np.stack(h_hist, axis=0)
 
         else:
-            return None
+            raise ValueError(f"Unknown policy_h: {self.policy_h}")
 
     def compute_h_hmax(self, x0, bH_dstb, include_h0=True, max_type="cubic_spline"):
 
@@ -90,7 +86,7 @@ class h_certificate:
         barrier_histories = []
 
         for H_dstb in bH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name, method=self.ivp_method)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
             h_history = self.evaluate_h_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
             h_values = h_history if include_h0 else h_history[1:]
@@ -168,7 +164,7 @@ class h_certificate:
         x0 = self.sys_dynm.chk_x(x0)
         hh_hmax = []
         for H_dstb in hH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name, method=self.ivp_method)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
             h_history = self.evaluate_h_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
             h_values = h_history if include_h0 else h_history[1:]
@@ -181,15 +177,12 @@ class h_certificate:
             hh_hmax.append(h_max)
 
         h_out = np.max(np.stack(hh_hmax, axis=0), axis=0)
-
-        # print("compute_h_hmax_from_dstb: h_out", h_out)
-
         return h_out
 
     def compute_h_hmax_diag(self, x0, hH_dstb, include_h0=False, max_type="cubic_spline"):
         h_out = np.zeros(self.nh)
         for j, H_dstb in enumerate(hH_dstb):
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name, method=self.ivp_method)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
             h_history = self.evaluate_h_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
             h_values = h_history if include_h0 else h_history[1:]
@@ -213,18 +206,62 @@ class h_certificate:
         h0_dstb = hH_dstb[:, 0]
         h_f = np.stack([self.sys_dynm.f(x0, d) for d in h0_dstb], axis=0)
         h_G = np.stack([self.sys_dynm.G(x0, d) for d in h0_dstb], axis=0)
-
         info["hx_gradhmax"] = grad_h_hmax
 
         return h_hmax, hH_dstb, grad_h_hmax, h_f, h_G, info
 
+    # ------------------ Batching ------------------------------
+    def h_function_batch(self, bx):
+        q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)
+        diff = bx[..., None, :2] - self.obs_pos                   # (..., nh, 2)
+        D = np.linalg.norm(diff, axis=-1)                         # (..., nh)
+        nq = np.einsum("...ij,...j->...i", diff / D[..., None], q)
+        return -(D - self.R_O + self.delta * nq)
+
+    def h_fun_backup_batch(self, bx):
+        q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)
+        diff = bx[..., None, :2] - self.obs_pos
+        D = np.linalg.norm(diff, axis=-1)
+        nq = np.einsum("...ij,...j->...i", diff / D[..., None], q)
+        return -(self.v_max * nq)
+
+    def evaluate_h_traj_batch(self, bTraj):
+        """(B, H+1, nx) -> (B, H+1, nh)."""
+        if self.policy_h == "policy_h":
+            return self.h_function_batch(bTraj)
+        elif self.policy_h == "backup_h":
+            return self.h_fun_backup_batch(bTraj)
+        elif self.policy_h == "mixed_h":
+            bh = self.h_function_batch(bTraj)
+            bh[..., -1, :] = self.h_fun_backup_batch(bTraj[..., -1, :])
+            return bh
+        else:
+            raise ValueError(f"Unknown policy_h: {self.policy_h}")
+
+    def hmax_batch(self, bh_hist, include_h0=False, max_type="cubic_spline"):
+
+        B, Hp1, nh = bh_hist.shape
+        t_hist = np.linspace(0.0, self.sys_dynm.dt * (Hp1 - 1), Hp1)
+        h_values = bh_hist if include_h0 else bh_hist[:, 1:]
+        t_values = t_hist if include_h0 else t_hist[1:]
+
+        if max_type != "cubic_spline":
+            return np.max(h_values, axis=1)
+
+        out = np.empty((B, nh))
+        for b in range(B):
+            for j in range(nh):
+                out[b, j] = self.max_cubic_spline(t_values, h_values[b, :, j])
+        return out
+
+    
 if __name__ == "__main__":
     # Single obstacle config from Control_env.py (margin_bar already added)
     obs_pos = np.array([[2.0, 2.5]])
     R_O = np.array([0.3 + 0.03])
 
     pol_clas = policy()
-    dynm = sys_dynm_dd(policy_class=pol_clas)
+    dynm = sys_dynm_dd(policy_class=pol_clas,process="single")
     cert = h_certificate(dynamic_class=dynm, obs_pos=obs_pos, R_O=R_O,
                          policy_h="policy_h", policy_name="backup_policy")
     noise = noise_train_sampler(nd=dynm.nd, rng=np.random.default_rng(42))
@@ -239,7 +276,7 @@ if __name__ == "__main__":
     print("h  value for individual state", h_x)
     print("hb value for individual state", hb_x)
     for H_dstb in BH_dstb[:2]:
-        trajectory = dynm.rollout_ivp(x0, H_dstb, policy_name="backup_policy", method="manual_RK4")
+        trajectory = dynm.rollout_ivp(x0, H_dstb, policy_name="backup_policy")
         h_trajectory = cert.evaluate_h_trajectory(trajectory=trajectory)
         print("Trajectory:\n", trajectory)
         print("h along trajectory:\n", h_trajectory)

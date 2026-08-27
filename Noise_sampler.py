@@ -42,13 +42,13 @@ class noise_train_sampler:
 class noise_test_sampler:
     def __init__(self, nd=1, rng=None):
         self.nd = nd
-        self._held = None
+        self._held = np.zeros(self.nd)
         self._interval = None
         self._worst = None
         self.rng = rng if rng is not None else np.random.default_rng()
 
     def reset(self):
-        self._held = None
+        self._held = np.zeros(self.nd)
         self._interval = None
 
     def zero_test(self, rng, x, k, scale):
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     sampler = noise_test_sampler(nd=2)
     uniform_noise = sampler.uniform_test(rng=sampler.rng, x=None, k=0, scale=1.0)
     bangbang_noise = sampler.bangbang_test(rng=sampler.rng, x=None, k=0, interval_size=1, scale=1.0)
-    zero_test_noise = sampler.zero_test(rng=sampler.rng, x=None, k=0)
+    zero_test_noise = sampler.zero_test(rng=sampler.rng, x=None, k=0, scale=1.0)
     sampler.set_worst(d0=[-1.0, 3.0])
     worst_noise = sampler.worst_case(rng=sampler.rng, x=None, k=0)
     print("-------------TEST NOISE SAMPLER-------------")
