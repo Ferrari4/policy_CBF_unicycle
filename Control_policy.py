@@ -11,6 +11,18 @@ class policy:
         self.kpw = 2.0 # proportional gain for heading error
         self.obs_pos = np.atleast_2d(obs_pos if obs_pos is not None
                                      else np.array([2.0, 2.5]))
+        self.rng = np.random.default_rng(12345)
+
+    def random_policy(self, state):
+        state = np.asarray(state).reshape(-1, 3)
+        B = state.shape[0]
+        v = self.rng.uniform(low=0.0,high=self.v_max,size=B)
+        om = self.rng.uniform(low=-self.om_max, high=self.om_max,size=B)
+        u = np.column_stack((v, om))
+        if self.process == "single":
+            assert B == 1
+            return u[0]
+        return u
 
     def proportional_policy(self, state):
         state = np.asarray(state).reshape(-1, 3)

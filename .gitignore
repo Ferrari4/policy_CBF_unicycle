@@ -6,3 +6,4 @@ check.py
 .vscode/
 *.egg-info/
 *.json
+*.xlsx

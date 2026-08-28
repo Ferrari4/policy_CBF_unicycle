@@ -96,8 +96,8 @@ def robot_triangle(pose, size=0.15):
 
     return local @ R.T + np.array([x, y])
 
-def plot_trajectories(states_list, inputs_list, obstacles=None, labels=None, dt=0.1, robot_size=0.15, 
-                      triangle_every=None, title="Unicycle trajectories", show=True, results_dir="Results"):
+def plot_trajectories(states_list, inputs_list, goal, obstacles=None, labels=None, dt=0.1, robot_size=0.15, 
+                      triangle_every=None, title="Unicycle trajectories", show=False, results_dir="Results"):
 
         obstacles = [] if obstacles is None else obstacles
         states_list = as_traj_list(states_list, "states_list", 3)
@@ -164,7 +164,7 @@ def plot_trajectories(states_list, inputs_list, obstacles=None, labels=None, dt=
                          linewidth=1.5, label=label, zorder=3)
             ax_traj.plot(states[0, 0], states[0, 1], "o", color="green",
                          markersize=9, markeredgecolor="black", zorder=5)
-            ax_traj.plot(states[-1, 0], states[-1, 1], "*", color="gold",
+            ax_traj.plot(goal[0], goal[1], "*", color="gold",
                          markersize=15, markeredgecolor="black", zorder=5)
 
             # robot triangles

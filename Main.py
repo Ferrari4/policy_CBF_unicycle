@@ -1,4 +1,5 @@
 import os
+from re import U
 import time
 from matplotlib.pyplot import sca
 import numpy as np
@@ -13,11 +14,7 @@ from Noise_sampler import noise_train_sampler, noise_test_sampler
 from Plot_results import (plot_trajectories, plot_h_history, plot_v_history)
 
 class policy_filter:
-    def __init__(self, controller="proportional_policy", 
-                 obstacles="single", 
-                 noise_choice="BangBang"):
-        
-        self.controller = controller
+    def __init__(self, controller, h_controller, v_controller, obstacles, noise_choice):
         self.noise_choice = noise_choice
 
         # Simulation parameters
@@ -27,7 +24,7 @@ class policy_filter:
         self.dt          = 0.005    # s, sim step size
 
         # General parameters
-        self.barrier_inflate = 0.0 # margin for safety (to avoid numerical issues)
+        self.barrier_inflate = 0.0  # margin for safety (to avoid numerical issues)
         self.v_max = 1.0            # m/s, max linear velocity
         self.v_min = 0.1            # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
@@ -75,7 +72,7 @@ class policy_filter:
                                   obs_pos=self.obs_pos, 
                                   R_O=self.R_O,
                                   policy_h="policy_h",
-                                  policy_name=self.controller,
+                                  policy_name=h_controller,
                                   delta = 0.0)
 
         self.cert_batch = h_certificate_batch(dynamic_class=self.dyn,
@@ -84,25 +81,28 @@ class policy_filter:
                                               hcert_class=self.cert)
 
         self.clf = v_certificate(dynamic_class=self.dyn, 
-                                 policy_name=self.controller, 
+                                 policy_name=v_controller, 
                                  goal=self.goal)
 
         self.rng = np.random.default_rng(12345)
         self.test_noise = noise_test_sampler(nd=self.dyn.nd, rng=self.rng)
         self.train_noise = noise_train_sampler(nd=self.dyn.nd, rng=self.rng)
 
-    def u_nominal(self, x):
-        if self.controller == "proportional_policy":
+    def u_nominal(self, x, controller):
+        if controller == "proportional_policy":
             u = self.policy.proportional_policy(x)
 
-        elif self.controller == "constant_policy":
+        elif controller == "constant_policy":
             u = self.policy.constant_policy(x)
 
-        elif self.controller == "backup_policy":
+        elif controller == "backup_policy":
             u = self.policy.backup_policy(x)
 
+        elif controller == "random_policy":
+            u = self.policy.random_policy(x)
+
         else:
-            raise ValueError(f"Invalid controller: {self.controller}.")
+            raise ValueError(f"Invalid controller: {controller}.")
 
         u = np.asarray(u, dtype=float)
 
@@ -157,7 +157,8 @@ class policy_filter:
         elif env_noise == "Zero":
             d_env = self.test_noise.zero_test()
         elif env_noise == "BangBang":
-            d_env = self.test_noise.bangbang_test(rng=self.rng, k=index, interval_size=self.interval_size, scale=self.d_scale)
+            d_env = self.test_noise.bangbang_test(rng=self.rng, k=index, 
+                                                  interval_size=self.interval_size, scale=self.d_scale)
         else:
             raise ValueError(f"Unknown environment noise: {env_noise}")
 
@@ -223,13 +224,8 @@ class policy_filter:
             LfH = grad_h[j] @ h_f[j]
             LGH = grad_h[j] @ h_G[j]
 
-            G.append(
-                pad(list(-LGH))
-            )
-
-            HG.append(
-                LfH + self.alpha * h_values[j]
-            )
+            G.append(pad(list(-LGH)))
+            HG.append(LfH + self.alpha * h_values[j])
 
     def _finalize_constraints(self, G, HG, n_z):
         G = np.asarray(G, dtype=float)
@@ -296,7 +292,6 @@ class policy_filter:
             u_act, intervening, _ = self._solve_qp(M, q, G, HG, u_nom, use_slack=False)
         except Exception as e:
             print("QP failed:", e)
-            # Same CBF-oriented fallback you used before.
             j = int(np.argmax(h_hmax))
             LGH = grad_h[j] @ h_G[j]
             u_lim = np.array([self.v_max, self.om_max])
@@ -376,6 +371,12 @@ class policy_filter:
 
         return u_act, intervening, solve_dt, V, delta, h_hmax
 
+    def clf_cbf_backup_qp(self, x, u_nom, d_nom, use_slack=False):
+        # assert self.cert.policy_h == "backup_h"
+        assert self.cert.policy_name == "backup_policy"
+        return self.clf_cbf_qp(x, u_nom, d_nom, use_slack)
+       
+
 def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
     goal=None,h_values=None,V=None,delta=None,value_name="CLF"):
     status = (
@@ -405,22 +406,27 @@ def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
         lines.append(f"  Distance goal  : {distance:.4f}")
     print("\n".join(lines))
 
-def run_simulation(method, x_s, controller,rollout_noise ,env_noise, no_obs):
-    safety = policy_filter(controller=controller, obstacles=no_obs, noise_choice=rollout_noise)
-    valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf"}
+def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_noise, env_noise, no_obs):
+    safety = policy_filter(controller=controller,
+                           h_controller=h_controller,
+                           v_controller=v_controller ,
+                           obstacles=no_obs, 
+                           noise_choice=rollout_noise)
+    valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf", "clf_cbf_backup", "None"}
     if method not in valid_methods:
         raise ValueError(f"Unknown method: {method}")
+    x_s = np.array(x_s)
     trajectory_actual = [x_s.copy()]
     applied_u = []
     h_now_log = []
     h_hmax_log = []
     V_log = []
     delta_log = []
-
+    print_summary = False
     for kk in range(safety.n_steps_sim):
         x_control = x_s.copy()
-        u_nom = safety.u_nominal(x_control)
         d_env = safety.noise_single(env_noise, kk)
+        u_nom = safety.u_nominal(x_control, controller)
         h_hmax = None
         V = None
         delta = None
@@ -456,16 +462,39 @@ def run_simulation(method, x_s, controller,rollout_noise ,env_noise, no_obs):
             V_log.append(V)
             delta_log.append(delta if not isinstance(intervening, str) else np.nan)
 
+        elif method == "clf_cbf_backup":
+            u_act, intervening, solve_dt, V, delta, h_hmax = safety.clf_cbf_backup_qp(x=x_control, 
+                                                                                      u_nom=u_nom, 
+                                                                                      d_nom=d_env, 
+                                                                                      use_slack=True)
+            h_now_log.append(safety.cert.h_function(x_control))
+            h_hmax_log.append(h_hmax)
+            V_log.append(V)
+            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+
+        elif method == "None":
+            u_act=u_nom
+            solve_dt = 0.0
+            intervening = "None"
+            h_hmax = 0.0
+            V = 0.0
+            delta = 0.0
+
         x_s = safety.propagate(x=x_control, u=u_act, d=d_env)
         trajectory_actual.append(x_s.copy())
         applied_u.append(np.asarray(u_act).copy())
 
         value_name = {"clf": "CLF value", "pclf": "P-CLF value", "clf_cbf": "CLF value"}.get(method, "CLF")
-        print_step_summary(kk=kk, x=x_s, u_nom=u_nom, u_act=u_act, solve_dt=solve_dt, 
-                           intervening=intervening, goal=safety.goal, h_values=h_hmax, 
-                           V=V, delta=delta, value_name=value_name)
+        if print_summary == True:
+            print_step_summary(kk=kk, x=x_s, u_nom=u_nom, u_act=u_act, solve_dt=solve_dt, 
+                            intervening=intervening, goal=safety.goal, h_values=h_hmax, 
+                            V=V, delta=delta, value_name=value_name)
         if np.linalg.norm(safety.goal - x_s[:2]) < 0.1:
             print("Goal reached!")
+            break
+
+        if kk >= 10000:
+            print(f"Early stop at step:{kk}")
             break
 
     # Plotting
@@ -476,9 +505,8 @@ def run_simulation(method, x_s, controller,rollout_noise ,env_noise, no_obs):
     V_log = np.asarray(V_log)
     delta_log = np.asarray(delta_log)
     obstacles = [(safety.obs_pos[i, 0], safety.obs_pos[i, 1], safety.R_O[i]) for i in range(len(safety.R_O))]
-    plot_trajectories(states_list=trajectory_actual, inputs_list=applied_u, 
-                      obstacles=obstacles, dt=safety.dt, title=method.upper(), 
-                      results_dir="Results")
+    plot_trajectories(states_list=trajectory_actual, inputs_list=applied_u, goal = safety.goal,
+                      obstacles=obstacles, dt=safety.dt, title=method.upper(), results_dir="Results")
     if len(h_now_log) > 0:
         plot_h_history(h_now=h_now_log, h_hmax=h_hmax_log, 
                        dt=safety.dt, path=os.path.join("Results", f"{method}_h_history.png"))
@@ -494,9 +522,12 @@ def run_simulation(method, x_s, controller,rollout_noise ,env_noise, no_obs):
 
 
 if __name__ == "__main__":
-    results = run_simulation(method="pclf", 
-                             x_s=np.array([0.5, 2.5, 0.0]), 
-                             controller="constant_policy", 
-                             rollout_noise="Uniform",
-                             env_noise="Uniform", 
+    results = run_simulation(method="None", 
+                             x_s=[0.5, 2.5, 0.0], 
+                             controller="backup_policy",
+                             h_controller="constant_policy", 
+                             v_controller="constant_policy",
+                             rollout_noise="Zero",
+                             env_noise="Zero", 
                              no_obs="multi")
+

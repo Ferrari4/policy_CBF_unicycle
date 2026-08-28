@@ -175,6 +175,9 @@ class sys_dynm_dd:
         elif policy_name == "backup_policy":
             control_method = self.controller.backup_policy
 
+        elif policy_name == "random_policy":
+            control_method = self.controller.random_policy
+
         elif policy_name == "input_U":
             control_method = None
 
