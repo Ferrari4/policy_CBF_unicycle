@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
 Results/
+Generated results/
 check.py
 *.png
 .vscode/
 *.egg-info/
 *.json
 *.xlsx
+test.py

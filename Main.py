@@ -5,6 +5,7 @@ from matplotlib.pyplot import sca
 import numpy as np
 import quadprog
 
+from Backup_pure import backup_filter
 from Dynamics import sys_dynm_dd
 from Control_policy import policy
 from Lyapunov_function import v_certificate
@@ -26,7 +27,7 @@ class policy_filter:
         # General parameters
         self.barrier_inflate = 0.0  # margin for safety (to avoid numerical issues)
         self.v_max = 1.0            # m/s, max linear velocity
-        self.v_min = 0.1            # m/s, min linear velocity, applied more so for the QP
+        self.v_min = 0.0          # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
         self.goal = np.array([4.5, 4.5]) # goal position in the plane in meters [x,y]
 
@@ -62,7 +63,7 @@ class policy_filter:
                              eps=0.6, 
                              goal=self.goal, 
                              process="batch")
-        
+             
         self.dyn = sys_dynm_dd(policy_class=self.policy, 
                                dt=self.dt, 
                                ivp_method="manual_RK4",
@@ -412,7 +413,8 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
                            v_controller=v_controller ,
                            obstacles=no_obs, 
                            noise_choice=rollout_noise)
-    valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf", "clf_cbf_backup", "None"}
+    backup_safety = backup_filter(policy_class=safety)
+    valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf", "clf_cbf_backup", "pure_backup", "None"}
     if method not in valid_methods:
         raise ValueError(f"Unknown method: {method}")
     x_s = np.array(x_s)
@@ -422,7 +424,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
     h_hmax_log = []
     V_log = []
     delta_log = []
-    print_summary = False
+    print_summary = True
     for kk in range(safety.n_steps_sim):
         x_control = x_s.copy()
         d_env = safety.noise_single(env_noise, kk)
@@ -449,7 +451,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             u_act, intervening, solve_dt, V, delta, h_hmax = safety.clf_cbf_qp(x=x_control, 
                                                                                u_nom=u_nom, 
                                                                                d_nom=d_env, 
-                                                                               use_slack=False)
+                                                                               use_slack=True)
             h_now_log.append(safety.cert.h_function(x_control))
             h_hmax_log.append(h_hmax)
             V_log.append(V)
@@ -468,9 +470,24 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
                                                                                       d_nom=d_env, 
                                                                                       use_slack=True)
             h_now_log.append(safety.cert.h_function(x_control))
+            
+            
+            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+
+        elif method == "pure_backup":
+            u_act, intervening, solve_dt = backup_safety.safety_Bcbf(x=x_control,
+                                                                     u_nom=u_nom, 
+                                                                     d_nom=d_env)
+            h_now = safety.cert.h_function(x_control)
+            h_now_log.append(h_now)
+            h_hmax = np.zeros_like(h_now)
+            V = 0.0
+            delta = 0.0
+            delta_log.append(
+                delta if not isinstance(intervening, str) else np.nan
+            )
             h_hmax_log.append(h_hmax)
             V_log.append(V)
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
 
         elif method == "None":
             u_act=u_nom
@@ -495,6 +512,10 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
 
         if kk >= 10000:
             print(f"Early stop at step:{kk}")
+            break
+
+        if intervening == "infeasible":
+            print(f"QP stopped due to infeasibility at step {kk}")
             break
 
     # Plotting
@@ -522,12 +543,12 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
 
 
 if __name__ == "__main__":
-    results = run_simulation(method="None", 
+    results = run_simulation(method="clf_cbf", 
                              x_s=[0.5, 2.5, 0.0], 
-                             controller="backup_policy",
-                             h_controller="constant_policy", 
-                             v_controller="constant_policy",
-                             rollout_noise="Zero",
-                             env_noise="Zero", 
+                             controller="proportional_policy",
+                             h_controller="backup_policy", 
+                             v_controller="proportional_policy",
+                             rollout_noise="Uniform",
+                             env_noise="Uniform", 
                              no_obs="multi")
 

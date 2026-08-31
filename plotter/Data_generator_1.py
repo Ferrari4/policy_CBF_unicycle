@@ -17,7 +17,7 @@ def save_results_to_excel(all_results, settings, filename=None):
 
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"simulation_{timestamp}.xlsx"
+        filename = f"plotter/simulation_{timestamp}.xlsx"
 
     wb = Workbook()
 
@@ -157,18 +157,20 @@ def save_results_to_excel(all_results, settings, filename=None):
 
 if __name__ == "__main__":
 
-    policy_lib = [
-        "constant_policy",
-        "backup_policy",
-        "proportional_policy",
-        "random_policy"
-    ]
+    # policy_lib = [
+    #     "constant_policy",
+    #     "backup_policy",
+    #     "proportional_policy",
+    #     "random_policy"
+    # ]
+
+    policy_lib = ["proportional_policy"]
 
     settings = {
-        "method": "rpcbf",
-        "x_s": [0.5, 2.0, 0.0],
-        "rollout_noise": "Zero",
-        "env_noise": "Zero",
+        "method": "pure_backup",
+        "x_s": [0.5, 1.5, 0.0],
+        "rollout_noise": "Uniform",
+        "env_noise": "Uniform",
         "no_obs": "single"
     }
 
