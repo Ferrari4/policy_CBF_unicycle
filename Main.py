@@ -1,6 +1,7 @@
 import os
 from re import U
 import time
+import matplotlib.pyplot as plt
 from matplotlib.pyplot import sca
 import numpy as np
 import quadprog
@@ -8,6 +9,7 @@ import quadprog
 from Backup_pure import backup_filter
 from Dynamics import sys_dynm_dd
 from Control_policy import policy
+from Moving_plot import live_plotter
 from Lyapunov_function import v_certificate
 from Barrier_function import h_certificate
 from Barrier_function_batch import h_certificate_batch
@@ -15,7 +17,7 @@ from Noise_sampler import noise_train_sampler, noise_test_sampler
 from Plot_results import (plot_trajectories, plot_h_history, plot_v_history)
 
 class policy_filter:
-    def __init__(self, controller, h_controller, v_controller, obstacles, noise_choice):
+    def __init__(self, h_controller, v_controller, obstacles, noise_choice):
         self.noise_choice = noise_choice
 
         # Simulation parameters
@@ -27,7 +29,7 @@ class policy_filter:
         # General parameters
         self.barrier_inflate = 0.0  # margin for safety (to avoid numerical issues)
         self.v_max = 1.0            # m/s, max linear velocity
-        self.v_min = 0.0          # m/s, min linear velocity, applied more so for the QP
+        self.v_min = 0.0            # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
         self.goal = np.array([4.5, 4.5]) # goal position in the plane in meters [x,y]
 
@@ -37,12 +39,14 @@ class policy_filter:
         self.d_scale = 0.05
 
         # cbf parameters
-        self.alpha = 2.0
+        self.alpha = 1.0
         self.inter_input = 1e-3
 
         # clf parameters
         self.slack_weight = 100
         self.gamma = 0.2 
+
+        self.main_controller = "clf"
         
         self.horizon       = int(round(self.T_rollout / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
@@ -181,8 +185,11 @@ class policy_filter:
         M = np.eye(n_z)
         if use_slack:
             M[nu, nu] = self.slack_weight
+
         q = np.zeros(n_z)
-        q[:nu] = np.asarray(u_nom, dtype=float)
+        q[0] = self.v_max
+        if self.main_controller != "clf":
+            q[:nu] = np.asarray(u_nom, dtype=float)
 
         def pad(row):
             return list(row) + ([0.0] if use_slack else [])
@@ -377,7 +384,6 @@ class policy_filter:
         assert self.cert.policy_name == "backup_policy"
         return self.clf_cbf_qp(x, u_nom, d_nom, use_slack)
        
-
 def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
     goal=None,h_values=None,V=None,delta=None,value_name="CLF"):
     status = (
@@ -408,11 +414,7 @@ def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
     print("\n".join(lines))
 
 def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_noise, env_noise, no_obs):
-    safety = policy_filter(controller=controller,
-                           h_controller=h_controller,
-                           v_controller=v_controller ,
-                           obstacles=no_obs, 
-                           noise_choice=rollout_noise)
+    safety = policy_filter(h_controller=h_controller, v_controller=v_controller, obstacles=no_obs, noise_choice=rollout_noise)
     backup_safety = backup_filter(policy_class=safety)
     valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf", "clf_cbf_backup", "pure_backup", "None"}
     if method not in valid_methods:
@@ -470,8 +472,6 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
                                                                                       d_nom=d_env, 
                                                                                       use_slack=True)
             h_now_log.append(safety.cert.h_function(x_control))
-            
-            
             delta_log.append(delta if not isinstance(intervening, str) else np.nan)
 
         elif method == "pure_backup":
@@ -483,9 +483,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             h_hmax = np.zeros_like(h_now)
             V = 0.0
             delta = 0.0
-            delta_log.append(
-                delta if not isinstance(intervening, str) else np.nan
-            )
+            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
             h_hmax_log.append(h_hmax)
             V_log.append(V)
 
@@ -506,6 +504,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             print_step_summary(kk=kk, x=x_s, u_nom=u_nom, u_act=u_act, solve_dt=solve_dt, 
                             intervening=intervening, goal=safety.goal, h_values=h_hmax, 
                             V=V, delta=delta, value_name=value_name)
+     
         if np.linalg.norm(safety.goal - x_s[:2]) < 0.1:
             print("Goal reached!")
             break
@@ -538,17 +537,21 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
         plot_v_history(V_log=V_log, delta_log=delta_log, dt=safety.dt, 
                        path=os.path.join("Results", f"{method}_V_history.png"), 
                        value_label=label, title=title)
+        
+    plt.close("all")
+    live_plot = live_plotter(obs_pos=safety.obs_pos,obs_radius=safety.R_O)
+    live_plot.update(trajectory=trajectory_actual,goal=safety.goal,pause=1e-5)
+        
     return {"states": trajectory_actual, "inputs": applied_u, "h_now": h_now_log, 
             "h_hmax": h_hmax_log, "V": V_log, "delta": delta_log, "safety": safety}
 
-
 if __name__ == "__main__":
-    results = run_simulation(method="clf_cbf", 
+    simulation = run_simulation(method="pclf", 
                              x_s=[0.5, 2.5, 0.0], 
                              controller="proportional_policy",
                              h_controller="backup_policy", 
                              v_controller="proportional_policy",
-                             rollout_noise="Uniform",
-                             env_noise="Uniform", 
+                             rollout_noise="Zero",
+                             env_noise="Zero", 
                              no_obs="multi")
 
