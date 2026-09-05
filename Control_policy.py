@@ -2,18 +2,17 @@ import numpy as np
 
 class policy:
     def __init__(self, v_max=1.0, om_max=2.0, obs_pos=None, 
-                 eps=0.6, goal=np.array([4.5, 4.5]), process="batch"):
+                 eps=0.6, process="batch"):
         self.v_max = v_max
         self.om_max = om_max
         self.eps = eps
         self.process = process
-        self.goal = np.asarray(goal)
         self.kpw = 2.0 # proportional gain for heading error
         self.obs_pos = np.atleast_2d(obs_pos if obs_pos is not None
                                      else np.array([2.0, 2.5]))
         self.rng = np.random.default_rng(12345)
 
-    def random_policy(self, state):
+    def random_policy(self, state, goal):
         state = np.asarray(state).reshape(-1, 3)
         B = state.shape[0]
         v = self.rng.uniform(low=0.0,high=self.v_max,size=B)
@@ -24,10 +23,10 @@ class policy:
             return u[0]
         return u
 
-    def proportional_policy(self, state):
+    def proportional_policy(self, state, goal):
         state = np.asarray(state).reshape(-1, 3)
         px, py, th = state[:, 0], state[:, 1], state[:, 2]
-        dx, dy = self.goal[0] - px, self.goal[1] - py
+        dx, dy = goal[0] - px, goal[1] - py
         th_goal = np.arctan2(dy, dx)
         th_err = np.arctan2(
             np.sin(th_goal - th),
@@ -40,7 +39,7 @@ class policy:
             return np.array([v[0], om[0]])
         return np.stack([v, om], axis=1)
 
-    def constant_policy(self, state):
+    def constant_policy(self, state, goal):
         state = np.asarray(state).reshape(-1, 3)
         u = np.tile(np.array([0.5, 0.0]), (state.shape[0], 1))
         if self.process == "single":
@@ -48,7 +47,7 @@ class policy:
             return u[0]
         return u
 
-    def backup_policy(self, state):
+    def backup_policy(self, state, goal):
         state = np.asarray(state).reshape(-1, 3)
         p = state[:, :2]                      
         th = state[:, 2] 

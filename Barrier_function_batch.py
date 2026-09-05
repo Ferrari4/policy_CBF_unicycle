@@ -26,13 +26,14 @@ class h_certificate_batch:
         self.policy_name = self.hcert_class.policy_name
   
 
-    def compute_h_hmax_diag(self, x0, hH_dstb, include_h0=False, max_type="cubic_spline"):
+    def compute_h_hmax_diag(self, x0, hH_dstb, goal, include_h0, max_type="cubic_spline"):
         bx0 = np.tile(x0, (self.nh, 1))
         bh_hmax = self.hcert_class.hmax_batch(
             self.hcert_class.evaluate_h_traj_batch(
                 self.sys_dynm.rollout_ivp(
                     bx0,
                     np.transpose(hH_dstb, (1, 0, 2)),
+                    goal=goal,
                     policy_name=self.policy_name
                 ).transpose(1, 0, 2)
             ),
@@ -42,7 +43,7 @@ class h_certificate_batch:
 
         return np.diagonal(bh_hmax).copy()
 
-    def compute_h_hmax(self, x0, bH_dstb, include_h0=True, max_type="cubic_spline"):
+    def compute_h_hmax(self, x0, bH_dstb, goal, include_h0, max_type="cubic_spline"):
         x0 = self.sys_dynm.chk_x(x0)
         bH_dstb = np.asarray(bH_dstb, dtype=float)
         if bH_dstb.ndim != 3:
@@ -55,6 +56,7 @@ class h_certificate_batch:
         bHp1_x = self.sys_dynm.rollout_ivp(
             bx0,
             np.transpose(bH_dstb, (1, 0, 2)),
+            goal=goal,
             policy_name=self.policy_name
         ).transpose(1, 0, 2)
 
@@ -90,20 +92,20 @@ class h_certificate_batch:
         }
         return h_hmax, hH_dstb, info
 
-    def get_value_and_grad(self, x0, bH_dstb, include_h0=False,
+    def get_value_and_grad(self, x0, bH_dstb, goal, include_h0,
                            max_type="cubic_spline", eps=1e-5):
-        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, include_h0, max_type)
+        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, goal, include_h0, max_type)
         nx, nh = self.nx, self.nh
         E = np.eye(nx) * eps
         pert = np.concatenate([x0 + E, x0 - E], axis=0)           # (2nx, nx)
         gx0 = np.repeat(pert, nh, axis=0)                         # (2nx*nh, nx)
         gd = np.tile(hH_dstb, (2 * nx, 1, 1))                     # (2nx*nh, H, nd)
-
         gh = self.hcert_class.hmax_batch(
             self.hcert_class.evaluate_h_traj_batch(
                 self.sys_dynm.rollout_ivp(
                     gx0,
                     np.transpose(gd, (1, 0, 2)),
+                    goal=goal,
                     policy_name=self.policy_name
                 ).transpose(1, 0, 2)
             ),
@@ -119,202 +121,3 @@ class h_certificate_batch:
 
         info["hx_gradhmax"] = grad_h_hmax
         return h_hmax, hH_dstb, grad_h_hmax, h_f, h_G, info
-
-if __name__ == "__main__":
-
-    from Control_policy import policy
-    from Noise_sampler import noise_train_sampler
-    import time
-
-    # ---------------------------------------------------------
-    # Problem setup
-    # ---------------------------------------------------------
-    obs_pos = np.array([
-        [2.0, 2.5],
-        [3.0, 3.5],
-        [1.5, 1.8]
-    ])
-
-    R_O = np.array([0.3, 0.2, 0.1]) + 0.03
-
-    x0 = np.array([
-        1.0,
-        1.5,
-        np.arctan2(1.0, 1.0)
-    ])
-
-    policy_name = "proportional_policy"
-    policy_h = "backup_h"
-
-    dt = 0.05
-
-    # ---------------------------------------------------------
-    # SINGLE setup
-    # ---------------------------------------------------------
-    policy_single = policy(
-        obs_pos=obs_pos,
-        process="single"
-    )
-
-    dynm_single = sys_dynm_dd(
-        policy_class=policy_single,
-        dt=dt,
-        ivp_method="manual_RK4",
-        process="single"
-    )
-
-    cert_single = h_certificate(
-        dynamic_class=dynm_single,
-        obs_pos=obs_pos,
-        R_O=R_O,
-        policy_h=policy_h,
-        policy_name=policy_name,
-        delta=0.0
-    )
-
-    # ---------------------------------------------------------
-    # BATCH setup
-    # ---------------------------------------------------------
-    policy_batch = policy(
-        obs_pos=obs_pos,
-        process="batch"
-    )
-
-    dynm_batch = sys_dynm_dd(
-        policy_class=policy_batch,
-        dt=dt,
-        ivp_method="manual_RK4",
-        process="batch"
-    )
-
-    cert_batch = h_certificate_batch(
-        dynamic_class=dynm_batch,
-        hcert_class=cert_single,
-        obs_pos=obs_pos,
-        R_O=R_O
-    )
-
-    # ---------------------------------------------------------
-    # Generate identical disturbance samples
-    # ---------------------------------------------------------
-    noise = noise_train_sampler(
-        nd=dynm_single.nd,
-        rng=np.random.default_rng(42)
-    )
-
-    bH_dstb, _ = noise.bangbang_uniform_train(
-        n_samples=50,
-        n_samples_uniform=25,
-        horizon=30,
-        interval_size=6,
-        scale=0.1
-    )
-
-    print("bH_dstb shape:", bH_dstb.shape)
-
-    # ---------------------------------------------------------
-    # SINGLE
-    # ---------------------------------------------------------
-    t0 = time.perf_counter()
-
-    result_single = cert_single.get_value_and_grad(
-        x0,
-        bH_dstb,
-        include_h0=True,
-        max_type="raw"
-    )
-
-    time_single = time.perf_counter() - t0
-
-    # ---------------------------------------------------------
-    # BATCH
-    # ---------------------------------------------------------
-    t0 = time.perf_counter()
-
-    result_batch = cert_batch.get_value_and_grad(
-        x0,
-        bH_dstb,
-        include_h0=True,
-        max_type="raw"
-    )
-
-    time_batch = time.perf_counter() - t0
-
-    # ---------------------------------------------------------
-    # Unpack
-    # ---------------------------------------------------------
-    h_s, d_s, grad_s, hf_s, hG_s, info_s = result_single
-    h_b, d_b, grad_b, hf_b, hG_b, info_b = result_batch
-
-    # ---------------------------------------------------------
-    # Compare outputs
-    # ---------------------------------------------------------
-    print("\n========== SINGLE vs BATCH ==========")
-
-    print("\nh_hmax")
-    print("single:", h_s)
-    print("batch :", h_b)
-    print("max error:", np.max(np.abs(h_s - h_b)))
-
-    print("\nWorst-case disturbance")
-    print("max error:", np.max(np.abs(d_s - d_b)))
-
-    print("\nGradient")
-    print("single:\n", grad_s)
-    print("batch:\n", grad_b)
-    print("max error:", np.max(np.abs(grad_s - grad_b)))
-
-    print("\nh_f")
-    print("max error:", np.max(np.abs(hf_s - hf_b)))
-
-    print("\nh_G")
-    print("max error:", np.max(np.abs(hG_s - hG_b)))
-
-    # ---------------------------------------------------------
-    # Compare internal data too
-    # ---------------------------------------------------------
-    print("\n========== INTERNAL DATA ==========")
-
-    keys = [
-        "bh_hmax",
-        "bHp1_x",
-        "bHp1h_h",
-        "hHp1_x",
-        "hHp1h_h",
-        "h_argmax"
-    ]
-
-    for key in keys:
-
-        a = np.asarray(info_s[key])
-        b = np.asarray(info_b[key])
-
-        if np.issubdtype(a.dtype, np.number):
-            error = np.max(np.abs(a - b))
-        else:
-            error = np.array_equal(a, b)
-
-        print(f"{key:12s}: {error}")
-
-    # ---------------------------------------------------------
-    # Overall accuracy test
-    # ---------------------------------------------------------
-    atol = 1e-10
-
-    passed = (
-        np.allclose(h_s, h_b, atol=atol, rtol=0)
-        and np.allclose(d_s, d_b, atol=atol, rtol=0)
-        and np.allclose(grad_s, grad_b, atol=atol, rtol=0)
-        and np.allclose(hf_s, hf_b, atol=atol, rtol=0)
-        and np.allclose(hG_s, hG_b, atol=atol, rtol=0)
-    )
-
-    print("\n========== RESULT ==========")
-
-    print("Accuracy test:", "PASS" if passed else "FAIL")
-
-    print(f"single time : {time_single * 1000:.3f} ms")
-    print(f"batch time  : {time_batch * 1000:.3f} ms")
-
-    if time_batch > 0:
-        print(f"speedup     : {time_single / time_batch:.2f}x")

@@ -71,7 +71,7 @@ class h_certificate:
         else:
             raise ValueError(f"Unknown policy_h: {self.policy_h}")
 
-    def compute_h_hmax(self, x0, bH_dstb, include_h0=True, max_type="cubic_spline"):
+    def compute_h_hmax(self, x0, bH_dstb, goal, include_h0, max_type="cubic_spline"):
 
         x0 = self.sys_dynm.chk_x(x0)
         bH_dstb = np.asarray(bH_dstb, dtype=float)
@@ -86,7 +86,7 @@ class h_certificate:
         barrier_histories = []
 
         for H_dstb in bH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, goal=goal ,policy_name=self.policy_name)
             h_history = self.evaluate_h_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
             h_values = h_history if include_h0 else h_history[1:]
@@ -160,29 +160,10 @@ class h_certificate:
 
         return float(np.max(vals))
 
-    def compute_h_hmax_from_dstb(self, x0, hH_dstb, include_h0=False, max_type="cubic_spline"):
-        x0 = self.sys_dynm.chk_x(x0)
-        hh_hmax = []
-        for H_dstb in hH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
-            h_history = self.evaluate_h_trajectory(trajectory)
-            t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
-            h_values = h_history if include_h0 else h_history[1:]
-            t_values = t_history if include_h0 else t_history[1:]
-            if max_type == "cubic_spline":
-                h_max = np.array([self.max_cubic_spline(t_values, h_values[:, j])
-                                  for j in range(self.nh)])
-            else:
-                h_max = np.max(h_values, axis=0)
-            hh_hmax.append(h_max)
-
-        h_out = np.max(np.stack(hh_hmax, axis=0), axis=0)
-        return h_out
-
-    def compute_h_hmax_diag(self, x0, hH_dstb, include_h0=False, max_type="cubic_spline"):
+    def compute_h_hmax_diag(self, x0, hH_dstb, goal, include_h0, max_type="cubic_spline"):
         h_out = np.zeros(self.nh)
         for j, H_dstb in enumerate(hH_dstb):
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, goal=goal,policy_name=self.policy_name)
             h_history = self.evaluate_h_trajectory(trajectory)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (h_history.shape[0] - 1), h_history.shape[0])
             h_values = h_history if include_h0 else h_history[1:]
@@ -193,14 +174,14 @@ class h_certificate:
                 h_out[j] = np.max(h_values[:, j])
         return h_out
 
-    def get_value_and_grad(self, x0, bH_dstb, include_h0=False, max_type="cubic_spline", eps=1e-5):
-        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, include_h0, max_type)
+    def get_value_and_grad(self, x0, bH_dstb, goal ,include_h0, max_type="cubic_spline", eps=1e-5):
+        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, goal, include_h0, max_type)
         grad_h_hmax = np.zeros((self.nh, self.nx))
         for i in range(self.nx):
             e = np.zeros(self.nx)
             e[i] = eps
-            vp = self.compute_h_hmax_diag(x0 + e, hH_dstb, include_h0, max_type)
-            vm = self.compute_h_hmax_diag(x0 - e, hH_dstb, include_h0, max_type)
+            vp = self.compute_h_hmax_diag(x0 + e, hH_dstb, goal, include_h0, max_type)
+            vm = self.compute_h_hmax_diag(x0 - e, hH_dstb, goal ,include_h0, max_type)
             grad_h_hmax[:, i] = (vp - vm) / (2.0 * eps)
 
         h0_dstb = hH_dstb[:, 0]
@@ -210,7 +191,8 @@ class h_certificate:
 
         return h_hmax, hH_dstb, grad_h_hmax, h_f, h_G, info
 
-    # ------------------ Batching ------------------------------
+# ---------------- Batching --------------------- #
+
     def h_function_batch(self, bx):
         q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)
         diff = bx[..., None, :2] - self.obs_pos                   # (..., nh, 2)
@@ -238,7 +220,7 @@ class h_certificate:
         else:
             raise ValueError(f"Unknown policy_h: {self.policy_h}")
 
-    def hmax_batch(self, bh_hist, include_h0=False, max_type="cubic_spline"):
+    def hmax_batch(self, bh_hist, include_h0, max_type="cubic_spline"):
 
         B, Hp1, nh = bh_hist.shape
         t_hist = np.linspace(0.0, self.sys_dynm.dt * (Hp1 - 1), Hp1)
@@ -253,49 +235,3 @@ class h_certificate:
             for j in range(nh):
                 out[b, j] = self.max_cubic_spline(t_values, h_values[b, :, j])
         return out
-
-    
-if __name__ == "__main__":
-    # Single obstacle config from Control_env.py (margin_bar already added)
-    obs_pos = np.array([[2.0, 2.5]])
-    R_O = np.array([0.3 + 0.03])
-
-    pol_clas = policy()
-    dynm = sys_dynm_dd(policy_class=pol_clas,process="single")
-    cert = h_certificate(dynamic_class=dynm, obs_pos=obs_pos, R_O=R_O,
-                         policy_h="policy_h", policy_name="backup_policy")
-    noise = noise_train_sampler(nd=dynm.nd, rng=np.random.default_rng(42))
-
-    # Start near the obstacle, heading toward it: interesting h values
-    x0 = np.array([1.0, 1.5, np.arctan2(2.5 - 1.5, 2.0 - 1.0)])
-    BH_dstb, _ = noise.bangbang_uniform_train(n_samples=10, n_samples_uniform=1, horizon=10, interval_size=3)
-
-    h_x = cert.h_function(state=x0)
-    hb_x = cert.h_fun_backup(state=x0)
-    print("---------Test for H function--------------")
-    print("h  value for individual state", h_x)
-    print("hb value for individual state", hb_x)
-    for H_dstb in BH_dstb[:2]:
-        trajectory = dynm.rollout_ivp(x0, H_dstb, policy_name="backup_policy")
-        h_trajectory = cert.evaluate_h_trajectory(trajectory=trajectory)
-        print("Trajectory:\n", trajectory)
-        print("h along trajectory:\n", h_trajectory)
-
-    h_hmax, hH_dstb, info = cert.compute_h_hmax(x0, BH_dstb, True, "cubic_spline")
-    print("Max value of H function: ", h_hmax)
-    print("Max disturbance shape: ", hH_dstb.shape)
-
-    print("-------Test: value from worst-case dstb matches---------------------")
-    v_from_dstb = cert.compute_h_hmax_from_dstb(x0, hH_dstb, include_h0=True, max_type="cubic_spline")
-    print("value from worst dstb :", v_from_dstb)
-    print("h_hmax (from compute) :", h_hmax)
-    print("match:", np.allclose(v_from_dstb, h_hmax),
-          "  max|diff| =", np.max(np.abs(v_from_dstb - h_hmax)))
-
-    print("\n-------- Test: get_value_and_grad --------")
-    h_hmax_g, hH_dstb_g, grad, h_f, h_G, info_g = cert.get_value_and_grad(
-        x0, BH_dstb, include_h0=False, max_type="cubic_spline")
-    print("h_hmax        :", h_hmax_g,          " shape", h_hmax_g.shape)
-    print("grad_h_hmax   :\n", grad,            "\n              shape", grad.shape, "(nh, nx)")
-    print("h_f           :\n", h_f,             "\n              shape", h_f.shape, "(nh, nx)")
-    print("h_G           :\n", h_G,             "\n              shape", h_G.shape, "(nh, nx, nu)")

@@ -2,38 +2,32 @@ import numpy as np
 from Dynamics import sys_dynm_dd
 
 class v_certificate:
-    def __init__(self ,dynamic_class: sys_dynm_dd,
-                 policy_name="constant_policy", 
-                 goal = np.array([4.5,4.5])):
-        
+    def __init__(self ,dynamic_class: sys_dynm_dd, policy_name):
         self.sys_dynm = dynamic_class
         self.nx = self.sys_dynm.nx
         self.policy_name = policy_name
-        self.goal = goal 
         self.k = 1.0
         self.nV = 1  
 
-    def get_params(self, x):
-        px, py, theta = x
-        px_goal, py_goal = self.goal
-        dx = px - px_goal
-        dy = py - py_goal
-        d = np.sqrt(dx**2 + dy**2)
-        theta_goal = np.arctan2(py_goal - py, px_goal - px)
-        # Wrapped heading error [-pi, pi]
-        theta_err = np.arctan2(
-            np.sin(theta_goal - theta),
-            np.cos(theta_goal - theta)
-        )
+    def get_params(self, x, goal): # Batch ready
+        x, goal = np.asarray(x), np.asarray(goal)
+        px, py, theta = x[..., 0], x[..., 1], x[..., 2]
+        dx, dy = px - goal[..., 0], py - goal[..., 1]
+        d = np.hypot(dx, dy)
+        theta_goal = np.arctan2(-dy, -dx)
+        theta_err = np.arctan2(np.sin(theta_goal - theta), 
+                               np.cos(theta_goal - theta))
         return dx, dy, d, theta_err
 
-    def clf_value(self, x):
-        _, _, d, theta_err = self.get_params(x)
+    def clf_value(self, x, goal): # Should not be Batched since a Valid CLF is not previewd
+        x = self.sys_dynm.chk_x(x) 
+        _, _, d, theta_err = self.get_params(x, goal)
         V = d**2 * (0.5 + self.k * (1.0 - np.cos(theta_err))) # CLF
         return V
 
-    def clf_value_gradient(self, x):
-        dx, dy, d, theta_err = self.get_params(x)
+    def clf_value_gradient(self, x, goal): # Should not be Batched since a Valid CLF is not previewd
+        x = self.sys_dynm.chk_x(x) 
+        dx, dy, d, theta_err = self.get_params(x, goal)
         sin_err = np.sin(theta_err)
         cos_err = np.cos(theta_err)
         A = 0.5 + self.k * (1.0 - cos_err)
@@ -48,23 +42,23 @@ class v_certificate:
         ])
         return grad_V
 
-    def clf_certificate(self, x):
-        _, _, d, theta_err = self.get_params(x)
+    def clf_certificate(self, x, goal): # Batch ready
+        _, _, d, theta_err = self.get_params(x, goal)
         V = 0.5 * d**2 + self.k * (1.0 - np.cos(theta_err))
-        return np.array([V])
+        return V[..., None]
 
-    def evaluate_v_trajectory(self, trajectory):
+    def evaluate_v_trajectory(self, trajectory, goal):
         if trajectory.ndim != 2:
             raise ValueError("trajectory must have shape (horizon + 1, nx)")
         if trajectory.shape[1] != self.nx:
             raise ValueError(f"Expected state dimension {self.nx}, got {trajectory.shape[1]}")
 
-        return np.stack([self.clf_certificate(state) for state in trajectory], axis=0)
+        return np.stack([self.clf_certificate(state, goal) for state in trajectory], axis=0)
 
     def aggregate_v(self, t_values, v_values):
         return np.max(v_values, axis=0)
 
-    def compute_v_vmax(self, x0, bH_dstb, include_v0=True):
+    def compute_v_vmax(self, x0, bH_dstb, goal, include_v0):
         x0 = self.sys_dynm.chk_x(x0)
         bH_dstb = np.asarray(bH_dstb, dtype=float)
         if bH_dstb.ndim != 3:
@@ -76,11 +70,11 @@ class v_certificate:
         trajectories = []
         value_histories = []
         for H_dstb in bH_dstb:
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, goal=goal,policy_name=self.policy_name)
             if self.sys_dynm.process == "batch":
                 assert trajectory.shape[1] == 1
                 trajectory = trajectory[:, 0, :]
-            v_history = self.evaluate_v_trajectory(trajectory)
+            v_history = self.evaluate_v_trajectory(trajectory, goal)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (v_history.shape[0] - 1), v_history.shape[0])
             v_values = v_history if include_v0 else v_history[1:]
             t_values = t_history if include_v0 else t_history[1:]
@@ -119,28 +113,28 @@ class v_certificate:
 
         return v_vmax, vH_dstb, info
 
-    def compute_v_diag(self, x0, vH_dstb, include_v0=True):
+    def compute_v_diag(self, x0, vH_dstb, goal ,include_v0):
         v_out = np.zeros(self.nV)
         for j, H_dstb in enumerate(vH_dstb):
-            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, policy_name=self.policy_name)
+            trajectory = self.sys_dynm.rollout_ivp(x0, H_dstb, goal=goal, policy_name=self.policy_name)
             if self.sys_dynm.process == "batch":
                 assert trajectory.shape[1] == 1
                 trajectory = trajectory[:, 0, :]
-            v_history = self.evaluate_v_trajectory(trajectory)
+            v_history = self.evaluate_v_trajectory(trajectory, goal)
             t_history = np.linspace(0.0, self.sys_dynm.dt * (v_history.shape[0] - 1), v_history.shape[0])
             v_values = v_history if include_v0 else v_history[1:]
             t_values = t_history if include_v0 else t_history[1:]
             v_out[j] = self.aggregate_v(t_values, v_values)[j]
         return v_out
 
-    def get_value_and_grad(self, x0, bH_dstb, include_v0=True, eps=1e-5):
-        v_vmax, vH_dstb, info = self.compute_v_vmax(x0, bH_dstb, include_v0)
+    def get_value_and_grad(self, x0, bH_dstb, goal ,include_v0, eps=1e-5):
+        v_vmax, vH_dstb, info = self.compute_v_vmax(x0, bH_dstb, goal, include_v0)
         grad_v_vmax = np.zeros((self.nV, self.nx))
         for i in range(self.nx):
             e = np.zeros(self.nx)
             e[i] = eps
-            vp = self.compute_v_diag(x0 + e, vH_dstb, include_v0)
-            vm = self.compute_v_diag(x0 - e, vH_dstb, include_v0)
+            vp = self.compute_v_diag(x0 + e, vH_dstb, goal, include_v0)
+            vm = self.compute_v_diag(x0 - e, vH_dstb, goal, include_v0)
             grad_v_vmax[:, i] = (vp - vm) / (2.0 * eps)
 
         v0_dstb = vH_dstb[:, 0]
@@ -151,121 +145,3 @@ class v_certificate:
 
         return v_vmax, vH_dstb, grad_v_vmax, v_f, v_G, info
 
-
-if __name__ == "__main__":
-
-    from Control_policy import policy
-    from Noise_sampler import noise_train_sampler
-
-    x0 = np.array([1.0, 1.5, np.pi / 4])
-    goal = np.array([4.5, 4.5])
-
-    # ---------------------------------------------------------
-    # Single dynamics object
-    # ---------------------------------------------------------
-    pol_single = policy(process="batch")
-
-    dynm_single = sys_dynm_dd(
-        policy_class=pol_single,
-        dt=0.05,
-        ivp_method="manual_RK4",
-        process="batch"
-    )
-
-    cert = v_certificate(
-        dynamic_class=dynm_single,
-        policy_name="constant_policy",
-        goal=goal
-    )
-
-    # ---------------------------------------------------------
-    # Direct CLF functions
-    # ---------------------------------------------------------
-    print("========== DIRECT CLF ==========")
-
-    V = cert.clf_value(x0)
-    gradV = cert.clf_value_gradient(x0)
-    V_cert = cert.clf_certificate(x0)
-
-    print("clf_value      :", V)
-    print("clf_gradient   :", gradV)
-    print("clf_certificate:", V_cert)
-
-    assert np.isscalar(V)
-    assert gradV.shape == (dynm_single.nx,)
-    assert V_cert.shape == (1,)
-
-    # ---------------------------------------------------------
-    # Disturbance samples
-    # ---------------------------------------------------------
-    noise = noise_train_sampler(
-        nd=dynm_single.nd,
-        rng=np.random.default_rng(42)
-    )
-
-    bH_dstb, _ = noise.bangbang_uniform_train(
-        n_samples=20,
-        n_samples_uniform=10,
-        horizon=20,
-        interval_size=5,
-        scale=0.1
-    )
-
-    # ---------------------------------------------------------
-    # Value rollout
-    # ---------------------------------------------------------
-    print("\n========== VALUE ROLLOUT ==========")
-
-    v_vmax, vH_dstb, grad_v_vmax, v_f, v_G, info = \
-        cert.get_value_and_grad(
-            x0,
-            bH_dstb,
-            include_v0=True
-        )
-
-    print("v_vmax:\n", v_vmax)
-    print("vH_dstb shape:", vH_dstb.shape)
-    print("grad_v_vmax:\n", grad_v_vmax)
-    print("v_f shape:", v_f.shape)
-    print("v_G shape:", v_G.shape)
-
-    print("\nInternal shapes:")
-    print("bHp1_x  :", info["bHp1_x"].shape)
-    print("bHp1v_v :", info["bHp1v_v"].shape)
-    print("bv_vmax :", info["bv_vmax"].shape)
-    print("v_argmax:", info["v_argmax"].shape)
-
-    # ---------------------------------------------------------
-    # Basic shape checks
-    # ---------------------------------------------------------
-    n_samples, horizon, _ = bH_dstb.shape
-
-    assert v_vmax.shape == (cert.nV,)
-    assert vH_dstb.shape == (cert.nV, horizon, dynm_single.nd)
-    assert grad_v_vmax.shape == (cert.nV, dynm_single.nx)
-    assert v_f.shape == (cert.nV, dynm_single.nx)
-    assert v_G.shape == (
-        cert.nV,
-        dynm_single.nx,
-        dynm_single.nu
-    )
-
-    assert info["bHp1_x"].shape == (
-        n_samples,
-        horizon + 1,
-        dynm_single.nx
-    )
-
-    assert info["bHp1v_v"].shape == (
-        n_samples,
-        horizon + 1,
-        cert.nV
-    )
-
-    assert info["bv_vmax"].shape == (
-        n_samples,
-        cert.nV
-    )
-
-    print("\n========== RESULT ==========")
-    print("v_certificate test: PASS")

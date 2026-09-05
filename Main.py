@@ -1,25 +1,25 @@
 import os
-from re import U
 import time
-import matplotlib.pyplot as plt
-from matplotlib.pyplot import sca
-import numpy as np
 import quadprog
+import numpy as np
+import matplotlib.pyplot as plt
 
 from Backup_pure import backup_filter
+from Get_goal import goal_dyn
 from Dynamics import sys_dynm_dd
 from Control_policy import policy
 from Moving_plot import live_plotter
 from Lyapunov_function import v_certificate
 from Barrier_function import h_certificate
 from Barrier_function_batch import h_certificate_batch
+from Lyapunov_function_batch import v_certificate_batch
 from Noise_sampler import noise_train_sampler, noise_test_sampler
 from Plot_results import (plot_trajectories, plot_h_history, plot_v_history)
 
 class policy_filter:
-    def __init__(self, h_controller, v_controller, obstacles, noise_choice):
-        self.noise_choice = noise_choice
-
+    def __init__(self, controller,h_controller, v_controller, 
+                 obstacles, noise_choice, include_h0, include_v0):
+        
         # Simulation parameters
         self.T_rollout   = 1.5      # s, certificate lookahead
         self.T_dstb_hold = 0.3      # s, piecewise-constant disturbance interval
@@ -31,7 +31,9 @@ class policy_filter:
         self.v_max = 1.0            # m/s, max linear velocity
         self.v_min = 0.0            # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
-        self.goal = np.array([4.5, 4.5]) # goal position in the plane in meters [x,y]
+        self.noise_choice = noise_choice
+        self.include_h0 = include_h0
+        self.include_v0 = include_v0
 
         # Noise parameters
         self.n_samples = 50
@@ -46,7 +48,7 @@ class policy_filter:
         self.slack_weight = 100
         self.gamma = 0.2 
 
-        self.main_controller = "clf"
+        self.main_controller = controller
         
         self.horizon       = int(round(self.T_rollout / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
@@ -64,8 +66,7 @@ class policy_filter:
         self.policy = policy(v_max=self.v_max, 
                              om_max=self.om_max,
                              obs_pos=self.obs_pos, 
-                             eps=0.6, 
-                             goal=self.goal, 
+                             eps=0.6,  
                              process="batch")
              
         self.dyn = sys_dynm_dd(policy_class=self.policy, 
@@ -86,25 +87,27 @@ class policy_filter:
                                               hcert_class=self.cert)
 
         self.clf = v_certificate(dynamic_class=self.dyn, 
-                                 policy_name=v_controller, 
-                                 goal=self.goal)
+                                 policy_name=v_controller)
+
+        self.clf_batch = v_certificate_batch(dynamic_class=self.dyn, 
+                                             vfun_class=self.clf)
 
         self.rng = np.random.default_rng(12345)
         self.test_noise = noise_test_sampler(nd=self.dyn.nd, rng=self.rng)
         self.train_noise = noise_train_sampler(nd=self.dyn.nd, rng=self.rng)
 
-    def u_nominal(self, x, controller):
+    def u_nominal(self, x, controller, goal):
         if controller == "proportional_policy":
-            u = self.policy.proportional_policy(x)
+            u = self.policy.proportional_policy(x, goal)
 
         elif controller == "constant_policy":
-            u = self.policy.constant_policy(x)
+            u = self.policy.constant_policy(x, goal)
 
         elif controller == "backup_policy":
-            u = self.policy.backup_policy(x)
+            u = self.policy.backup_policy(x, goal)
 
         elif controller == "random_policy":
-            u = self.policy.random_policy(x)
+            u = self.policy.random_policy(x, goal)
 
         else:
             raise ValueError(f"Invalid controller: {controller}.")
@@ -169,8 +172,8 @@ class policy_filter:
 
         return d_env
 
-    def propagate(self, x, u, d):
-        x_next = self.dyn.solve_ivp_fun(x0=x, d=d, u=u)
+    def propagate(self, x, u, d, goal):
+        x_next = self.dyn.solve_ivp_fun(x0=x, d=d, goal=goal, u=u)
         x_next = np.asarray(x_next)
         if self.dyn.process == "batch":
             x_next = x_next.reshape(-1, self.dyn.nx)
@@ -179,7 +182,7 @@ class policy_filter:
             return x_next[0]
         return x_next.reshape(self.dyn.nx)
 
-    def _init_qp(self, u_nom, use_slack=False):
+    def _init_qp(self, u_nom, use_slack):
         nu = self.dyn.nu
         n_z = nu + 1 if use_slack else nu
         M = np.eye(n_z)
@@ -188,8 +191,9 @@ class policy_filter:
 
         q = np.zeros(n_z)
         q[0] = self.v_max
-        if self.main_controller != "clf":
+        if self.main_controller != "clf_nom":       
             q[:nu] = np.asarray(u_nom, dtype=float)
+         
 
         def pad(row):
             return list(row) + ([0.0] if use_slack else [])
@@ -210,7 +214,7 @@ class policy_filter:
 
         return M, q, G, HG, pad
 
-    def _add_clf_constraint(self, G: list, HG: list, V, grad_V, f_x, g_x, use_slack=False):
+    def _add_clf_constraint(self, G: list, HG: list, V, grad_V, f_x, g_x, use_slack):
         LfV = grad_V @ f_x
         LGV = grad_V @ g_x
 
@@ -254,18 +258,21 @@ class policy_filter:
         )
         return G, HG
 
-    def _solve_qp(self, M, q, G, HG, u_nom, use_slack=False):
+    def _solve_qp(self, M, q, G, HG, u_nom, use_slack):
         nu = self.dyn.nu
         qp_sol = quadprog.solve_qp(M,q,np.asarray(G, dtype=float).T,np.asarray(HG, dtype=float),0)
         u_act = qp_sol[0][:nu]
         delta = (qp_sol[0][nu] if use_slack else 0.0)
-        intervening = (np.linalg.norm(u_act - u_nom)>= self.inter_input)
+        if self.main_controller != "clf_nom":
+            intervening = (np.linalg.norm(u_act - u_nom)>= self.inter_input)
+        else:
+            intervening = "Not applicable"
         return u_act, intervening, delta
     
-    def clf_qp(self, x, u_nom, d_nom, use_slack=False):
+    def clf_qp(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
-        V = self.clf.clf_value(x)
-        grad_V = self.clf.clf_value_gradient(x)
+        V = self.clf.clf_value(x, goal)
+        grad_V = self.clf.clf_value_gradient(x, goal)
         f_x = self.dyn.f(x, d_nom)
         g_x = self.dyn.G(x, d_nom)
         M, q, G, HG, _ = self._init_qp(u_nom, use_slack=use_slack)
@@ -281,7 +288,7 @@ class policy_filter:
             delta = 0.0
         solve_dt = time.perf_counter() - start_time
 
-        if not isinstance(intervening, str):
+        if intervening != "infeasible":
             Vdot = grad_V @ (f_x + g_x @ u_act)
             assert Vdot <= -self.gamma * V + delta + 1e-7, (
                 f"CLF violated at "
@@ -289,15 +296,16 @@ class policy_filter:
             
         return u_act, intervening, solve_dt, V, delta
 
-    def rpcbf_qp(self, x, u_nom):
+    def rpcbf_qp(self, x, u_nom, goal, use_slack):
         start_time = time.perf_counter()
-        h_hmax, _, grad_h, h_f, h_G, _ = self.cert_batch.get_value_and_grad(x, self.noise_selection(), include_h0=False)
-        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=False)
+        h_hmax, _, grad_h, h_f, h_G, _ = self.cert_batch.get_value_and_grad(x, self.noise_selection(), 
+                                                                            goal, include_h0=self.include_h0)
+        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
         self._add_cbf_constraints(G, HG, h_hmax, grad_h, h_f, h_G, pad)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         try:
-            u_act, intervening, _ = self._solve_qp(M, q, G, HG, u_nom, use_slack=False)
+            u_act, intervening, _ = self._solve_qp(M, q, G, HG, u_nom, use_slack=use_slack)
         except Exception as e:
             print("QP failed:", e)
             j = int(np.argmax(h_hmax))
@@ -310,9 +318,10 @@ class policy_filter:
 
         return u_act, intervening, solve_dt, h_hmax
 
-    def pclf_qp(self, x, u_nom, use_slack=False):
+    def pclf_qp(self, x, u_nom, goal ,use_slack):
         start_time = time.perf_counter()
-        v_vmax, _, grad_v, v_f, v_G, _ = self.clf.get_value_and_grad(x, self.noise_selection(override=True), include_v0=True)
+        v_vmax, _, grad_v, v_f, v_G, _ = self.clf_batch.get_value_and_grad(x, self.noise_selection(), 
+                                                                     goal, include_v0=self.include_v0)
         V = v_vmax[0]
         grad_V = grad_v[0]
         M, q, G, HG, _ = self._init_qp(u_nom, use_slack=use_slack)
@@ -329,17 +338,18 @@ class policy_filter:
 
         solve_dt = time.perf_counter() - start_time
 
-        if not isinstance(intervening, str):
+        if intervening != "infeasible":
             Vdot = grad_V @ (v_f[0] + v_G[0] @ u_act)
             assert Vdot <= -self.gamma * V + delta + 1e-7, f"P-CLF violated: Vdot={Vdot:.4f}"
 
         return u_act, intervening, solve_dt, V, delta
 
-    def clf_cbf_qp(self, x, u_nom, d_nom, use_slack=False):
+    def clf_cbf_qp(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
-        h_hmax, _, grad_h, h_f, h_G, _ = self.cert_batch.get_value_and_grad(x, self.noise_selection(), include_h0=False)
-        V = self.clf.clf_value(x)
-        grad_V = self.clf.clf_value_gradient(x)
+        h_hmax, _, grad_h, h_f, h_G, _ = self.cert_batch.get_value_and_grad(x, self.noise_selection(), 
+                                                                            goal, include_h0=self.include_h0)
+        V = self.clf.clf_value(x, goal)
+        grad_V = self.clf.clf_value_gradient(x, goal)
         f_x = self.dyn.f(x, d_nom)
         g_x = self.dyn.G(x, d_nom)
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
@@ -366,7 +376,7 @@ class policy_filter:
             delta = 0.0
         solve_dt = time.perf_counter() - start_time
 
-        if not isinstance(intervening, str):
+        if intervening != "infeasible":
                 Vdot = grad_V @ (f_x + g_x @ u_act)
                 assert Vdot <= -self.gamma * V + delta + 1e-7
                 for j in range(len(h_hmax)):
@@ -378,14 +388,10 @@ class policy_filter:
                     )
 
         return u_act, intervening, solve_dt, V, delta, h_hmax
-
-    def clf_cbf_backup_qp(self, x, u_nom, d_nom, use_slack=False):
-        # assert self.cert.policy_h == "backup_h"
-        assert self.cert.policy_name == "backup_policy"
-        return self.clf_cbf_qp(x, u_nom, d_nom, use_slack)
        
 def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
     goal=None,h_values=None,V=None,delta=None,value_name="CLF"):
+
     status = (
         "INTERVENE" if intervening is True
         else intervening if isinstance(intervening, str)
@@ -396,6 +402,7 @@ def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
         f"  State          : x = [{x[0]:7.4f}, {x[1]:7.4f}, {x[2]:7.4f}]",
         f"  Nominal control: u_nom = [{u_nom[0]:6.3f}, {u_nom[1]:6.3f}]",
         f"  Actual control : u_act = [{u_act[0]:6.3f}, {u_act[1]:6.3f}]",
+        f"  Goal           : goal = [{goal[0]:7.4f}, {goal[1]:7.4f}]"
     ]
     if h_values is not None:
         h_str = ", ".join(f"{h:7.4f}" for h in np.atleast_1d(h_values))
@@ -413,12 +420,34 @@ def print_step_summary(kk,x,u_nom,u_act,solve_dt,intervening,
         lines.append(f"  Distance goal  : {distance:.4f}")
     print("\n".join(lines))
 
-def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_noise, env_noise, no_obs):
-    safety = policy_filter(h_controller=h_controller, v_controller=v_controller, obstacles=no_obs, noise_choice=rollout_noise)
+def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slack, rollout_noise, 
+                   env_noise, no_obs, init_goal, goal_dyn_op, goal_motion, include_h0, include_v0):
+    
+    safety = policy_filter(controller=controller,
+                           h_controller=h_controller, 
+                           v_controller=v_controller, 
+                           obstacles=no_obs, 
+                           noise_choice=rollout_noise,
+                           include_h0=include_h0,
+                           include_v0=include_v0)
+
     backup_safety = backup_filter(policy_class=safety)
-    valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf", "clf_cbf_backup", "pure_backup", "None"}
+
+    goal_class = goal_dyn(goal_dyn=goal_dyn_op, 
+                          goal_motion=goal_motion, 
+                          noise_sampler=safety.test_noise, 
+                          init_goal=init_goal,
+                          dt=safety.dt)
+
+    print_summary = True
+    live_plot = False
+    
+    valid_methods = {"rpcbf", "clf", "clf_cbf", 
+                     "pclf", "pure_backup", "None"}
+    
     if method not in valid_methods:
         raise ValueError(f"Unknown method: {method}")
+    
     x_s = np.array(x_s)
     trajectory_actual = [x_s.copy()]
     applied_u = []
@@ -426,17 +455,25 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
     h_hmax_log = []
     V_log = []
     delta_log = []
-    print_summary = True
+    
     for kk in range(safety.n_steps_sim):
         x_control = x_s.copy()
         d_env = safety.noise_single(env_noise, kk)
-        u_nom = safety.u_nominal(x_control, controller)
+        goal = goal_class.call_goal()
+
+        if controller != "clf_nom":
+            u_nom = safety.u_nominal(x_control, controller, goal)
+        else:
+            u_nom = np.zeros(safety.dyn.nu)
         h_hmax = None
         V = None
         delta = None
       
         if method == "rpcbf":
-            u_act, intervening, solve_dt, h_hmax = safety.rpcbf_qp(x=x_control, u_nom=u_nom)
+            u_act, intervening, solve_dt, h_hmax = safety.rpcbf_qp(x=x_control, 
+                                                                   u_nom=u_nom, 
+                                                                   goal=goal,
+                                                                   use_slack=var_slack)
             h_now = safety.cert.h_function(x_control)
             h_now_log.append(h_now)
             h_hmax_log.append(h_hmax)
@@ -445,34 +482,29 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             u_act, intervening, solve_dt, V, delta = safety.clf_qp(u_nom=u_nom, 
                                                                    x=x_control, 
                                                                    d_nom=d_env, 
-                                                                   use_slack=False)
+                                                                   goal=goal,
+                                                                   use_slack=var_slack)
             V_log.append(V)
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
 
         elif method == "clf_cbf":
             u_act, intervening, solve_dt, V, delta, h_hmax = safety.clf_cbf_qp(x=x_control, 
                                                                                u_nom=u_nom, 
                                                                                d_nom=d_env, 
-                                                                               use_slack=True)
+                                                                               goal=goal,
+                                                                               use_slack=var_slack)
             h_now_log.append(safety.cert.h_function(x_control))
             h_hmax_log.append(h_hmax)
             V_log.append(V)
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
 
         elif method == "pclf":
             u_act, intervening, solve_dt, V, delta = safety.pclf_qp(x=x_control, 
                                                                     u_nom=u_nom,
-                                                                    use_slack=True)
+                                                                    goal=goal,
+                                                                    use_slack=var_slack)
             V_log.append(V)
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
-
-        elif method == "clf_cbf_backup":
-            u_act, intervening, solve_dt, V, delta, h_hmax = safety.clf_cbf_backup_qp(x=x_control, 
-                                                                                      u_nom=u_nom, 
-                                                                                      d_nom=d_env, 
-                                                                                      use_slack=True)
-            h_now_log.append(safety.cert.h_function(x_control))
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
 
         elif method == "pure_backup":
             u_act, intervening, solve_dt = backup_safety.safety_Bcbf(x=x_control,
@@ -483,7 +515,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             h_hmax = np.zeros_like(h_now)
             V = 0.0
             delta = 0.0
-            delta_log.append(delta if not isinstance(intervening, str) else np.nan)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
             h_hmax_log.append(h_hmax)
             V_log.append(V)
 
@@ -495,17 +527,19 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
             V = 0.0
             delta = 0.0
 
-        x_s = safety.propagate(x=x_control, u=u_act, d=d_env)
+        x_s = safety.propagate(x=x_control, u=u_act, d=d_env, goal=goal)
         trajectory_actual.append(x_s.copy())
         applied_u.append(np.asarray(u_act).copy())
 
         value_name = {"clf": "CLF value", "pclf": "P-CLF value", "clf_cbf": "CLF value"}.get(method, "CLF")
-        if print_summary == True:
+        if print_summary:
             print_step_summary(kk=kk, x=x_s, u_nom=u_nom, u_act=u_act, solve_dt=solve_dt, 
-                            intervening=intervening, goal=safety.goal, h_values=h_hmax, 
+                            intervening=intervening, goal=goal, h_values=h_hmax, 
                             V=V, delta=delta, value_name=value_name)
-     
-        if np.linalg.norm(safety.goal - x_s[:2]) < 0.1:
+        else:
+            print(f"Step:{kk}")
+
+        if np.linalg.norm(goal - x_s[:2]) < 0.1:
             print("Goal reached!")
             break
 
@@ -525,7 +559,7 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
     V_log = np.asarray(V_log)
     delta_log = np.asarray(delta_log)
     obstacles = [(safety.obs_pos[i, 0], safety.obs_pos[i, 1], safety.R_O[i]) for i in range(len(safety.R_O))]
-    plot_trajectories(states_list=trajectory_actual, inputs_list=applied_u, goal = safety.goal,
+    plot_trajectories(states_list=trajectory_actual, inputs_list=applied_u, goal=init_goal,
                       obstacles=obstacles, dt=safety.dt, title=method.upper(), results_dir="Results")
     if len(h_now_log) > 0:
         plot_h_history(h_now=h_now_log, h_hmax=h_hmax_log, 
@@ -537,21 +571,29 @@ def run_simulation(method, x_s, controller,h_controller ,v_controller, rollout_n
         plot_v_history(V_log=V_log, delta_log=delta_log, dt=safety.dt, 
                        path=os.path.join("Results", f"{method}_V_history.png"), 
                        value_label=label, title=title)
-        
-    plt.close("all")
-    live_plot = live_plotter(obs_pos=safety.obs_pos,obs_radius=safety.R_O)
-    live_plot.update(trajectory=trajectory_actual,goal=safety.goal,pause=1e-5)
+
+    if live_plot:    
+        plt.close("all")
+        live_plot = live_plotter(obs_pos=safety.obs_pos,obs_radius=safety.R_O)
+        live_plot.update(trajectory=trajectory_actual,goal=init_goal,pause=1e-5)
         
     return {"states": trajectory_actual, "inputs": applied_u, "h_now": h_now_log, 
             "h_hmax": h_hmax_log, "V": V_log, "delta": delta_log, "safety": safety}
 
 if __name__ == "__main__":
-    simulation = run_simulation(method="pclf", 
-                             x_s=[0.5, 2.5, 0.0], 
-                             controller="proportional_policy",
+    # "clf_nom" or "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
+    simulation = run_simulation(method="pclf", # "rpcbf", "clf", "clf_cbf", "pclf", "pure_backup", "None"
+                             x_s=[0.5, 2.5, 0.0], # intial position
+                             controller="clf_nom", 
                              h_controller="backup_policy", 
-                             v_controller="proportional_policy",
-                             rollout_noise="Zero",
-                             env_noise="Zero", 
-                             no_obs="multi")
+                             v_controller="proportional_policy", 
+                             var_slack = False,   # True or False
+                             rollout_noise="Zero",# Uniform or Zero or BangBang
+                             env_noise="Zero",    # Uniform or Zero or BangBang
+                             no_obs="multi",         # multi or single
+                             init_goal= [4.5, 4.5],  # mean goal position
+                             goal_dyn_op = "static", # static or sin_y or random
+                             goal_motion= "stoc", # stoc or det (only for sin_y)
+                             include_h0 = True,
+                             include_v0 = True)        
 
