@@ -80,6 +80,72 @@ def as_traj_list(data, name, dim):
         f"{name} must be 2D or 3D, got shape {arr.shape}"
     )
 
+def plot_vdot_history(Vdot_log, V_log, delta_log, dt, gamma, path,
+                      Vdot_actual=None, value_label="V", title="CLF decrease condition"):
+    """
+    Three-band view of the CLF decrease condition along one run.
+
+        Vdot_log    (N,)  analytic  grad_V @ (f + G u_act)      -- what the QP saw
+        V_log       (N,)  V(x_k)
+        delta_log   (N,)  QP slack (nan where infeasible)
+        Vdot_actual (N,)  optional, e.g. np.diff(V_log)/dt      -- what actually happened
+        gamma             CLF rate used in the constraint
+
+    Bands:  Vdot <= -gamma V        exponential decrease (slack == 0)
+            -gamma V < Vdot < 0     decreasing, slower than gamma (slack active)
+            Vdot >= 0               not decreasing (CLF condition failed here)
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    Vdot  = np.asarray(Vdot_log, dtype=float)
+    V     = np.asarray(V_log, dtype=float)
+    delta = np.asarray(delta_log, dtype=float)
+    N     = min(Vdot.shape[0], V.shape[0], delta.shape[0])
+    Vdot, V, delta = Vdot[:N], V[:N], delta[:N]
+    t     = np.arange(N) * dt
+    req   = -gamma * V                                   # what the constraint demanded
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+
+    # slack-active intervals
+    active = np.nan_to_num(delta, nan=0.0) > 1e-9
+    if active.any():
+        edges = np.diff(np.concatenate([[0], active.astype(int), [0]]))
+        for s, e in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
+            ax.axvspan(t[s], t[min(e, N - 1)], color="orange", alpha=0.15, lw=0,
+                       label="slack active" if s == np.where(edges == 1)[0][0] else None)
+
+    ax.axhline(0.0, color="k", ls="--", lw=1.2, label=r"$\dot V = 0$")
+    ax.plot(t, req,  color="tab:red",  lw=1.4, ls=":", label=fr"$-\gamma {value_label}$  ($\gamma$={gamma})")
+    ax.plot(t, Vdot, color="tab:blue", lw=1.6, label=fr"$\dot {value_label}$ (QP, analytic)")
+    if Vdot_actual is not None:
+        Va = np.asarray(Vdot_actual, dtype=float)[:N]
+        ax.plot(t[:Va.shape[0]], Va, color="tab:green", lw=1.0, alpha=0.8,
+                label=fr"$\dot {value_label}$ (actual, finite diff)")
+
+    # infeasible steps, if any
+    infeas = np.isnan(delta)
+    if infeas.any():
+        ax.plot(t[infeas], np.zeros(infeas.sum()), "x", color="red", ms=6, label="QP infeasible")
+
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel(fr"$\dot {value_label}$")
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # summary: how much of the run sat in each band
+    exp_band  = Vdot <= req + 1e-7
+    slow_band = (~exp_band) & (Vdot < 0.0)
+    fail_band = Vdot >= 0.0
+    print(f"[{title}]  exponential {exp_band.mean():6.1%} | "
+          f"decreasing-but-slow {slow_band.mean():6.1%} | "
+          f"not decreasing {fail_band.mean():6.1%} | "
+          f"infeasible steps {infeas.sum()}")
+
 def robot_triangle(pose, size=0.15):
     x, y, theta = pose
 

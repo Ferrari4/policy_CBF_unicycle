@@ -26,7 +26,8 @@ class policy:
     def proportional_policy(self, state, goal):
         state = np.asarray(state).reshape(-1, 3)
         px, py, th = state[:, 0], state[:, 1], state[:, 2]
-        dx, dy = goal[0] - px, goal[1] - py
+        goal = np.asarray(goal, dtype=float).reshape(-1, 2)   
+        dx, dy = goal[:, 0] - px, goal[:, 1] - py
         th_goal = np.arctan2(dy, dx)
         th_err = np.arctan2(
             np.sin(th_goal - th),

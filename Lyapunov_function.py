@@ -42,9 +42,10 @@ class v_certificate:
         ])
         return grad_V
 
-    def clf_certificate(self, x, goal): # Batch ready
+    def clf_certificate(self, x, goal, k=None): # Batch ready
+        k = self.k if k is None else k
         _, _, d, theta_err = self.get_params(x, goal)
-        V = 0.5 * d**2 + self.k * (1.0 - np.cos(theta_err))
+        V = 0.5 * d**2 + k * (1.0 - np.cos(theta_err))
         return V[..., None]
 
     def evaluate_v_trajectory(self, trajectory, goal):
