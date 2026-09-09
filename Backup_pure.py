@@ -14,12 +14,23 @@ class backup_filter():
         self.v_min = policy_class.v_min
         self.time_horizion = policy_class.T_rollout
         self.alpha = self.policy_class.alpha
-        self.alpha_b = 2.0
+        self.alpha_b = self.policy_class.alpha
         self.inter_input = self.policy_class.inter_input
         self.tspan_b = np.linspace(0.0, 
                                    self.policy_class.T_rollout, 
                                    self.policy_class.horizon + 1)
         self.delta = self.policy_class.cert.delta
+
+    def obs_timeline(self):
+        """Obstacle pos / vel / acc at the backup sample times t_now + tspan_b[k].
+        Each (H+1, n_obs, 2).  Acceleration by central difference of the velocity."""
+        Hp1 = len(self.tspan_b)
+        cert = self.policy_class.cert
+        obs_pos, obs_vel = cert.obs_timeline(Hp1)
+        e = cert.vel_eps
+        obs_acc = (cert.obs_vel_timeline(Hp1, t_shift=e)
+                   - cert.obs_vel_timeline(Hp1, t_shift=-e)) / (2.0 * e)
+        return obs_pos, obs_vel, obs_acc
         
     def safety_Bcbf(self, x, u_nom, d_nom):
         start_time = time.perf_counter()
@@ -30,18 +41,19 @@ class backup_filter():
         f_x = self.policy_class.dyn.f(x,d_nom)
         g_x = self.policy_class.dyn.G(x,d_nom)
         x_rollout, Q_rollout = self.backup_rollout(x, d_nom)
-        obs_pos_now = self.obs_class.pos_now()
-        for i, obs in enumerate(obs_pos_now):
-            for k in range(1, len(self.tspan_b)):
+        obs_pos, obs_vel, obs_acc = self.obs_timeline()          # (H+1, n_obs, 2) each
+        K = len(self.tspan_b)
+        for i in range(obs_pos.shape[1]):
+            for k in range(1, K):
                 x_k = x_rollout[k]
                 Q_k = Q_rollout[k]
-                if len(self.tspan_b)-1 == k:
-                    grad_h, h_v = self.compute_filter_hb(x_k, obs, d_nom)
-                    constrain_r = -((grad_h @ Q_k ) @ f_x + self.alpha_b * h_v)
+                if k == K - 1:
+                    grad_h, h_v, dh_dt = self.compute_filter_hb(x_k, obs_pos[k, i], d_nom, obs_vel[k, i], obs_acc[k, i])
+                    constrain_r = -((grad_h @ Q_k) @ f_x + dh_dt + self.alpha_b * h_v)
                 else:
-                    grad_h, h_v = self.compute_filter_h(x_k, obs, self.R_O[i])
-                    constrain_r = -((grad_h @ Q_k ) @ f_x + self.alpha * h_v)
-                constrain_l = (grad_h @ Q_k ) @ g_x
+                    grad_h, h_v, dh_dt = self.compute_filter_h(x_k, obs_pos[k, i], self.R_O[i], obs_vel[k, i])
+                    constrain_r = -((grad_h @ Q_k) @ f_x + dh_dt + self.alpha * h_v)
+                constrain_l = (grad_h @ Q_k) @ g_x
                 G.append(constrain_l.tolist())
                 HG.append(float(constrain_r))
         G = np.asarray(G, dtype=float)
@@ -144,12 +156,13 @@ class backup_filter():
 
         return A_b, v_b, w_b, obs_idx
 
-    def compute_filter_h(self, x, obs_pos, r0):
+    def compute_filter_h(self, x, obs_pos, r0, obs_vel=None):
         p = x[:2] 
         p_O = obs_pos[:2]
         psi = x[2]
         p = np.asarray(p, dtype=float).reshape(2)
         p_O = np.asarray(p_O, dtype=float).reshape(2)
+        v_O = np.zeros(2) if obs_vel is None else np.asarray(obs_vel[:2], dtype=float).reshape(2)
         diff = p - p_O
         D = np.linalg.norm(diff)
         n = diff / D
@@ -163,15 +176,17 @@ class backup_filter():
             grad_h_pos,
             grad_h_psi
         ])
-
-        return grad_h, h
+        dh_dt = -(n @ v_O) - self.delta * (q @ P @ v_O) / D
+        return grad_h, h, dh_dt
     
-    def compute_filter_hb(self, x, obs_pos,d_nom):
+    def compute_filter_hb(self, x, obs_pos, d_nom, obs_vel=None, obs_acc=None):
         p = x[:2]  
         p_O = obs_pos[:2]
         psi = x[2]
         p = np.asarray(p, dtype=float).reshape(2)
         p_O = np.asarray(p_O, dtype=float).reshape(2)
+        v_O = np.zeros(2) if obs_vel is None else np.asarray(obs_vel[:2], dtype=float).reshape(2)
+        a_O = np.zeros(2) if obs_acc is None else np.asarray(obs_acc[:2], dtype=float).reshape(2)
         diff = p - p_O
         D = np.linalg.norm(diff)
         n = diff / D
@@ -179,7 +194,7 @@ class backup_filter():
         q = np.array([np.cos(psi), np.sin(psi)])
         r = np.array([-np.sin(psi), np.cos(psi)])
         d_xy = np.asarray(d_nom[:2], dtype=float)
-        radial_velocity = q * self.v_max + d_xy
+        radial_velocity = q * self.v_max + d_xy - v_O
         h_b = n @ radial_velocity
         grad_hb_pos = (radial_velocity @ P) / D
         grad_hb_psi =  n @ (r * self.v_max)
@@ -187,5 +202,5 @@ class backup_filter():
             grad_hb_pos,
             grad_hb_psi
         ])
-
-        return grad_hb, h_b
+        dhb_dt = -(radial_velocity @ P @ v_O) / D - (n @ a_O)
+        return grad_hb, h_b, dhb_dt

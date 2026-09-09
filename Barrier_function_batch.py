@@ -26,20 +26,25 @@ class h_certificate_batch:
         self.policy_h = self.hcert_class.policy_h    
         self.policy_name = self.hcert_class.policy_name
         self.terminate_on_hb = terminate_on_hb          # new ctor arg, default False
+        # Stop a backup rollout once h_b <= 0, i.e. n^T (q v_max - dp_O/dt) >= 0 (paper (27)).
+        # NOTE: rollout_ivp's stop_fn gets (state, dstb) only, so the obstacle is evaluated
+        # at the CURRENT time rather than the rollout time.  Exact for a static obstacle; for
+        # a moving one this is the same approximation the previous version made.
         self.stop_fn = (
             (lambda s, d: self.hcert_class.h_fun_backup_batch(
-                np.atleast_2d(s)[:, None, :],            # (B, 1, nx)
-                self.obs_class.pos(self.obs_class.t)     # (1, n_obs, 2) obstacle NOW
+                np.atleast_2d(s)[:, None, :],                          # (B, 1, nx)
+                self.hcert_class.obs_pos_now()[None],                  # (1, n_obs, 2)
+                self.hcert_class.obs_vel_now()[None],                  # (1, n_obs, 2)
             )[:, 0].max(axis=1) <= 0.0)
             if terminate_on_hb else None
         )
 
 
-    def _eval_h_frozen(self, bTraj, b_stop, obs_pos):
+    def _eval_h_frozen(self, bTraj, b_stop, obs_pos, obs_vel):
         """h along the rollout, but once a row has been frozen by stop_fn (state no longer
         evolves) its h is held at the stop sample instead of being re-evaluated against an
         obstacle that keeps moving.  No-op for a static obstacle."""
-        bh = self.hcert_class.evaluate_h_traj_batch(bTraj, obs_pos)          # (B, H+1, nh)
+        bh = self.hcert_class.evaluate_h_traj_batch(bTraj, obs_pos, obs_vel)  # (B, H+1, nh)
         if b_stop is not None:
             B, Hp1, _ = bh.shape
             k = np.arange(Hp1)[None, :]                                       # (1, H+1)
@@ -49,20 +54,20 @@ class h_certificate_batch:
             bh = np.where(frozen[..., None], held, bh)
         return bh
 
-    def compute_h_hmax_diag(self, x0, hH_dstb, goal, include_h0, obs_pos, max_type="cubic_spline"):
+    def compute_h_hmax_diag(self, x0, hH_dstb, goal, include_h0, obs_pos, obs_vel, max_type="cubic_spline"):
         bx0 = np.tile(x0, (self.nh, 1))
         bTraj, b_stop = self.sys_dynm.rollout_ivp(
             bx0, np.transpose(hH_dstb, (1, 0, 2)), goal=goal,
             policy_name=self.policy_name, stop_fn=self.stop_fn, return_stop=True)
         bh_hmax = self.hcert_class.hmax_batch(
-            self._eval_h_frozen(bTraj.transpose(1, 0, 2), b_stop, obs_pos),
+            self._eval_h_frozen(bTraj.transpose(1, 0, 2), b_stop, obs_pos, obs_vel),
             include_h0,
             max_type
         )
 
         return np.diagonal(bh_hmax).copy()
 
-    def compute_h_hmax(self, x0, bH_dstb, goal, include_h0, obs_pos, max_type="cubic_spline"):
+    def compute_h_hmax(self, x0, bH_dstb, goal, include_h0, obs_pos, obs_vel, max_type="cubic_spline"):
         x0 = self.sys_dynm.chk_x(x0)
         bH_dstb = np.asarray(bH_dstb, dtype=float)
         if bH_dstb.ndim != 3:
@@ -76,7 +81,7 @@ class h_certificate_batch:
         bx0, np.transpose(bH_dstb, (1, 0, 2)), goal=goal,
         policy_name=self.policy_name, stop_fn=self.stop_fn, return_stop=True)
         bHp1_x = bHp1_x.transpose(1, 0, 2)
-        bHp1h_h = self._eval_h_frozen(bHp1_x, b_stop, obs_pos)
+        bHp1h_h = self._eval_h_frozen(bHp1_x, b_stop, obs_pos, obs_vel)
         bh_hmax = self.hcert_class.hmax_batch(
             bHp1h_h,
             include_h0,
@@ -116,9 +121,10 @@ class h_certificate_batch:
                            max_type="cubic_spline", eps=1e-5):
         # Obstacle timeline over the rollout: same for every rollout in this control step.
         H = np.asarray(bH_dstb).shape[1]
-        obs_pos = self.obs_class.rollout_obs(H + 1)                          # (H+1, n_obs, 2)
+        obs_pos, obs_vel = self.hcert_class.obs_timeline(H + 1)             # each (H+1, n_obs, 2)
 
-        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, goal, include_h0, obs_pos, max_type)
+        h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, goal, include_h0,
+                                                    obs_pos, obs_vel, max_type)
         nx, nh = self.nx, self.nh
         E = np.eye(nx) * eps
         pert = np.concatenate([x0 + E, x0 - E], axis=0)           # (2nx, nx)
@@ -128,22 +134,23 @@ class h_certificate_batch:
             gx0, np.transpose(gd, (1, 0, 2)), goal=goal,
             policy_name=self.policy_name, stop_fn=self.stop_fn, return_stop=True)
         gh = self.hcert_class.hmax_batch(
-            self._eval_h_frozen(gTraj.transpose(1, 0, 2), g_stop, obs_pos),
+            self._eval_h_frozen(gTraj.transpose(1, 0, 2), g_stop, obs_pos, obs_vel),
             include_h0,
             max_type
         ).reshape(2 * nx, nh, nh)
         gdiag = np.diagonal(gh, axis1=1, axis2=2)                 # (2nx, nh)
         grad_h_hmax = ((gdiag[:nx] - gdiag[nx:]) / (2.0 * eps)).T  # (nh, nx)
 
-        # dV/dt: explicit time dependence through the moving obstacle.
+        # dV/dt: explicit time dependence through the moving obstacle (paper (25)/(28)).
         # The trajectories themselves do not depend on obstacle time (backup policy reads
         # the current position), so re-evaluate h on the SAME worst-case trajectories with
-        # the obstacle timeline shifted by eps.  Identically zero for a static obstacle.
+        # the obstacle timeline (position AND velocity) shifted by eps.  Zero for a static obstacle.
+        obs_pos_s, obs_vel_s = self.hcert_class.obs_timeline(H + 1, t_shift=eps)
         h_dt = self.hcert_class.hmax_batch(
             self._eval_h_frozen(
                 info["hHp1_x"],                                             # (nh, H+1, nx)
                 info["h_stop_step"],
-                self.obs_class.rollout_obs(H + 1, t_shift=eps)
+                obs_pos_s, obs_vel_s
             ),
             include_h0,
             max_type

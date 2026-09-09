@@ -20,7 +20,7 @@ from Plot_results import (plot_trajectories, plot_h_history, plot_v_history, plo
 
 class policy_filter:
     def __init__(self, controller,h_controller, v_controller, 
-                 obstacles, noise_choice, include_h0, include_v0):
+                 obstacles, static_obs,noise_choice, include_h0, include_v0):
         
         # Simulation parameters
         self.T_rollout   = 1.5      # s, certificate lookahead
@@ -29,12 +29,15 @@ class policy_filter:
         self.dt          = 0.02    # s, sim step size
 
         # General parameters
-        self.v_max = 1.0            # m/s, max linear velocity
+        self.v_max = 3.0            # m/s, max linear velocity
         self.v_min = 0.0            # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
-        self.noise_choice = noise_choice
-        self.include_h0 = include_h0
-        self.include_v0 = include_v0
+
+        # obstacles parameters
+        radius_to_inflate = 0.0
+        amplitude = 0.5
+        frequency = 2
+        phase = 0.0
 
         # Noise parameters
         self.n_samples = 50
@@ -44,26 +47,29 @@ class policy_filter:
         # cbf parameters
         self.alpha = 2.0
         self.inter_input = 1e-3
-        cbf_delta = 0.0
+        cbf_delta = 0.5
         cbf_early_terminate = False
 
         # clf parameters
         self.slack_weight = 100
         self.gamma = 0.1
 
+        self.noise_choice = noise_choice
+        self.include_h0 = include_h0
+        self.include_v0 = include_v0
         self.main_controller = controller
         
         self.horizon       = int(round(self.T_rollout / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
         self.n_steps_sim   = int(round(self.T_sim / self.dt))
         
-        self.obs_class = ObsDyn(layout="multi",
-                                static=False,
+        self.obs_class = ObsDyn(layout=obstacles,
+                                static=static_obs,
                                 dt=self.dt,
-                                barrier_inflate=0.0, 
-                                amplitude=1, 
-                                freq=5, 
-                                phi=0)
+                                barrier_inflate=radius_to_inflate, 
+                                amplitude=amplitude, 
+                                freq=frequency, 
+                                phi=phase)
             
         self.policy = policy(v_max=self.v_max, 
                              om_max=self.om_max,
@@ -193,8 +199,8 @@ class policy_filter:
 
         q = np.zeros(n_z)
         # q[0] = self.v_max
-        if self.main_controller != "clf_nom":       
-            q[:nu] = np.asarray(u_nom, dtype=float)
+        # if self.main_controller != "clf_nom":       
+        #     q[:nu] = np.asarray(u_nom, dtype=float)
          
         def pad(row):
             return list(row) + ([0.0] if use_slack else [])
@@ -530,12 +536,17 @@ def print_step_summary(kk, x, u_nom, u_act, solve_dt, intervening,
     print("\n".join(lines))
 
 def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slack, rollout_noise, 
-                   env_noise, no_obs, init_goal, goal_dyn_op, goal_motion, include_h0, include_v0):
-    
+                   env_noise, no_obs, obs_static,init_goal, goal_dyn_op, goal_motion, include_h0, include_v0):
+
+    print_summary = False
+    live_plot = False
+    early_stop = 10000
+
     safety = policy_filter(controller=controller,
                            h_controller=h_controller, 
                            v_controller=v_controller, 
                            obstacles=no_obs, 
+                           static_obs=obs_static,
                            noise_choice=rollout_noise,
                            include_h0=include_h0,
                            include_v0=include_v0)
@@ -547,9 +558,6 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                           noise_sampler=safety.test_noise, 
                           init_goal=init_goal,
                           dt=safety.dt)
-
-    print_summary = True
-    live_plot = True
     
     valid_methods = {"rpcbf", "clf", "clf_cbf", "pclf_goals",
                      "pclf", "pure_backup", "None", "pclf_rpcbf_qp"}
@@ -695,9 +703,6 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                     value_name={"clf": "CLF value", "pclf": "P-CLF value", "clf_cbf": "CLF value"}.get(method, "CLF"),
                     stop_step=h_stop, dt=safety.dt)
 
-        else:
-            print(f"Step:{kk}")
-
         if np.linalg.norm(goal - x_s[:2]) < 0.1:
             print("Goal reached!")
             print(f"final: {np.linalg.norm(init_goal - x_s[:2])}")
@@ -706,7 +711,7 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                 print(f"compute mean: {np.linalg.norm(g_hat - x_s[:2])}")
             break
 
-        if kk >= 10000:
+        if kk >= early_stop:
             print(f"Early stop at step:{kk}")
             print(f"final: {np.linalg.norm(init_goal - x_s[:2])}")
             if g_hat is not None:
@@ -765,15 +770,16 @@ if __name__ == "__main__":
 
     # *1 "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
     settings = {
-        "method": "rpcbf",            # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp"
-        "x_s": [0.0, 2.2, 0.0],               # initial position [x, y, yaw]
-        "controller": "proportional_policy",  # "clf_nom" or *1
-        "h_controller": "constant_policy",# *1
-        "v_controller": "proportional_policy",# *1
+        "method": "pclf_rpcbf_qp",        # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp"
+        "x_s": [0.0, 1.0, 0.0],           # initial position [x, y, yaw]
+        "controller": "backup_policy",  # "clf_nom" or *1
+        "h_controller": "backup_policy",# *1
+        "v_controller": "backup_policy",# *1
         "var_slack": True,
         "rollout_noise": "Zero",              # Uniform or Zero or BangBang
         "env_noise": "Zero",                  # Uniform or Zero or BangBang
         "no_obs": "single",                    # multi or single
+        "obs_static": True,
         "init_goal": [4.0, 1.0],              # mean goal position
         "goal_dyn_op": "static",              # static or sin_y or random
         "goal_motion": "stoc",                # stoc or det (only for sin_y)
@@ -783,4 +789,5 @@ if __name__ == "__main__":
 
     results  = run_simulation(**settings)  
     save_results_to_excel({settings["controller"]: results}, settings)
+
 

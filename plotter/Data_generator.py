@@ -2,6 +2,7 @@ import numpy as np
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from pathlib import Path
 
 
 def to_2d(arr):
@@ -11,16 +12,18 @@ def to_2d(arr):
     return arr.reshape(len(arr), -1)
 
 
-def save_results_to_excel(all_results, settings, filename=None):
+def save_results_to_excel(results_dict, settings, run_id=None):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    suffix = "" if run_id is None else f"_run_{run_id:02d}"
 
-    if filename is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"plotter/simulation_{timestamp}.xlsx"
+    output_dir = Path("plotter")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = output_dir / f"simulation_{timestamp}{suffix}.xlsx"
 
     wb = Workbook()
-    wb.remove(wb.active)          # drop the default sheet
+    wb.remove(wb.active)
 
-    for policy_name, results in all_results.items():
+    for policy_name, results in results_dict.items():
 
         ws = wb.create_sheet(title=policy_name[:31])
 
