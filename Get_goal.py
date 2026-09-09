@@ -30,10 +30,8 @@ class goal_dyn:
             return self.goal_update
 
         elif self.goal_dyn == "random":
-            step = self.noise_sampler.rng.normal(0.0, self.sigma * np.sqrt(self.dt), size=2)
-            self.goal_update += step
-            self.t += self.dt
-            return self.goal_update
+            step = self.noise_sampler.rng.normal(0.0, self.sigma, size=2)
+            return self.init_goal + step
 
         else:
             raise ValueError(f"Unknown goal_dyn: {self.goal_dyn}")

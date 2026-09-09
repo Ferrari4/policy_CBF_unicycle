@@ -152,6 +152,7 @@ class live_plotter:
         self,
         trajectory,
         goal=None,
+        obs_traj=None,
         pause=0.05
     ):
         """
@@ -169,6 +170,10 @@ class live_plotter:
 
             Moving goal trajectory:
                 shape (N, 2)
+
+        obs_traj : np.ndarray or None
+            Obstacle centre positions over time, shape (N, n_obs, 2).
+            None -> obstacles stay where __init__ drew them.
 
         pause : float
             Delay between each trajectory state, in seconds.
@@ -213,6 +218,36 @@ class live_plotter:
                 raise ValueError(
                     "goal must have shape (2,) or (N, 2)"
                 )
+
+        # ----------------------------------
+        # Prepare obstacles
+        # ----------------------------------
+
+        moving_obs = False
+
+        if obs_traj is not None:
+            if self.obstacle_points is None:
+                raise ValueError(
+                    "obs_traj given but no obstacles were passed to __init__"
+                )
+
+            obs_traj = np.asarray(obs_traj, dtype=float)
+            n_obs = self.obs_pos.shape[0]
+
+            if obs_traj.shape != (N, n_obs, 2):
+                raise ValueError(
+                    "obs_traj must have shape (N, n_obs, 2).\n"
+                    f"trajectory: {trajectory.shape}\n"
+                    f"obs_traj:   {obs_traj.shape}"
+                )
+            moving_obs = True
+
+            # Dashed trace of each obstacle centre (created once, reused)
+            if not hasattr(self, "obstacle_paths"):
+                self.obstacle_paths = [
+                    self.ax.plot([], [], "k--", linewidth=1, alpha=0.6)[0]
+                    for _ in range(n_obs)
+                ]
 
         # ----------------------------------
         # Animate trajectory
@@ -276,6 +311,26 @@ class live_plotter:
                     goal[:k + 1, 0],
                     goal[:k + 1, 1]
                 )
+
+            # ----------------------------------
+            # Obstacles
+            # ----------------------------------
+
+            if moving_obs:
+
+                # Current obstacle centres
+                self.obstacle_points.set_data(
+                    obs_traj[k, :, 0],
+                    obs_traj[k, :, 1]
+                )
+
+                # Move each boundary circle and extend its trace
+                for i, circle in enumerate(self.obstacle_circles):
+                    circle.center = (obs_traj[k, i, 0], obs_traj[k, i, 1])
+                    self.obstacle_paths[i].set_data(
+                        obs_traj[:k + 1, i, 0],
+                        obs_traj[:k + 1, i, 1]
+                    )
 
             # ----------------------------------
             # Redraw

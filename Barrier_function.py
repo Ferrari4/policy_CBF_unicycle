@@ -2,20 +2,18 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 
 from Dynamics import sys_dynm_dd
-from Control_policy import policy
-from Noise_sampler import noise_train_sampler
+from Get_obstacles import ObsDyn
 
 class h_certificate:
-    def __init__(self, dynamic_class: sys_dynm_dd, obs_pos, R_O,
+    def __init__(self, dynamic_class: sys_dynm_dd, obs_class: ObsDyn,
                  policy_h="policy_h", policy_name="proportional_policy", delta=0.3):
 
         self.sys_dynm = dynamic_class
         self.v_max = self.sys_dynm.controller.v_max
         self.om_max = self.sys_dynm.controller.om_max
         self.nx = self.sys_dynm.nx          # state dimension [px, py, th]
-        self.obs_pos = np.asarray(obs_pos, dtype=float).reshape(-1, 2)
-        self.R_O = np.atleast_1d(np.asarray(R_O, dtype=float))
-        assert self.obs_pos.shape[0] == self.R_O.shape[0]
+        self.obs_class = obs_class          # ObsDyn: positions are a function of time
+        self.R_O = np.atleast_1d(np.asarray(obs_class.R_O, dtype=float))
         self.nh = self.R_O.shape[0]         # one barrier per obstacle
         self.delta = delta                  # heading inflation term
         self.policy_h = policy_h            # "policy_h" | "backup_h" | "mixed_h"
@@ -27,9 +25,10 @@ class h_certificate:
         px, py, th = state
         p = np.array([px, py])
         q = np.array([np.cos(th), np.sin(th)])
+        obs_pos = self.obs_class.pos_now()  # (n_obs, 2) obstacle position NOW
         h = np.zeros(self.nh)
         for i in range(self.nh):
-            diff = p - self.obs_pos[i]
+            diff = p - obs_pos[i]
             D = np.linalg.norm(diff)
             n = diff / D
             h[i] = -(D - self.R_O[i] + self.delta * (n @ q))
@@ -42,9 +41,10 @@ class h_certificate:
         px, py, th = state
         p = np.array([px, py])
         q = np.array([np.cos(th), np.sin(th)])
+        obs_pos = self.obs_class.pos_now()
         h_b = np.zeros(self.nh)
         for i in range(self.nh):
-            diff = p - self.obs_pos[i]
+            diff = p - obs_pos[i]
             D = np.linalg.norm(diff)
             n = diff / D
             h_b[i] = -(self.v_max * (n @ q))
@@ -193,29 +193,29 @@ class h_certificate:
 
 # ---------------- Batching --------------------- #
 
-    def h_function_batch(self, bx):
-        q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)
-        diff = bx[..., None, :2] - self.obs_pos                   # (..., nh, 2)
-        D = np.linalg.norm(diff, axis=-1)                         # (..., nh)
-        nq = np.einsum("...ij,...j->...i", diff / D[..., None], q)
+    def h_function_batch(self, bx, obs_pos):
+        q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)   # (B, H+1, 2)
+        diff = bx[:, :, None, :2] - obs_pos[None]                            # (B, H+1, nh, 2)
+        D = np.linalg.norm(diff, axis=-1)                                    # (B, H+1, nh)
+        nq = np.einsum("bhij,bhj->bhi", diff / D[..., None], q)             # (B, H+1, nh)
         return -(D - self.R_O + self.delta * nq)
 
-    def h_fun_backup_batch(self, bx):
+    def h_fun_backup_batch(self, bx, obs_pos):
         q = np.stack([np.cos(bx[..., 2]), np.sin(bx[..., 2])], axis=-1)
-        diff = bx[..., None, :2] - self.obs_pos
+        diff = bx[:, :, None, :2] - obs_pos[None]
         D = np.linalg.norm(diff, axis=-1)
-        nq = np.einsum("...ij,...j->...i", diff / D[..., None], q)
+        nq = np.einsum("bhij,bhj->bhi", diff / D[..., None], q)
         return -(self.v_max * nq)
 
-    def evaluate_h_traj_batch(self, bTraj):
-        """(B, H+1, nx) -> (B, H+1, nh)."""
+    def evaluate_h_traj_batch(self, bTraj, obs_pos):
+        """(B, H+1, nx), (H+1, n_obs, 2) -> (B, H+1, nh)."""
         if self.policy_h == "policy_h":
-            return self.h_function_batch(bTraj)
+            return self.h_function_batch(bTraj, obs_pos)
         elif self.policy_h == "backup_h":
-            return self.h_fun_backup_batch(bTraj)
+            return self.h_fun_backup_batch(bTraj, obs_pos)
         elif self.policy_h == "mixed_h":
-            bh = self.h_function_batch(bTraj)
-            bh[..., -1, :] = self.h_fun_backup_batch(bTraj[..., -1, :])
+            bh = self.h_function_batch(bTraj, obs_pos)
+            bh[:, -1, :] = self.h_fun_backup_batch(bTraj[:, -1:, :], obs_pos[-1:])[:, 0]
             return bh
         else:
             raise ValueError(f"Unknown policy_h: {self.policy_h}")

@@ -2,7 +2,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 
 from Control_policy import policy
-from Noise_sampler import noise_train_sampler
+
 
 class sys_dynm_dd:
     def __init__(self, policy_class: policy, dt=0.1, ivp_method="manual_RK4", process="batch"):
@@ -156,7 +156,7 @@ class sys_dynm_dd:
         else:
             raise ValueError(f"Unknown IVP method: {self.ivp_method}")
 
-    def rollout_ivp(self, x0, H_dstb, goal ,policy_name: str, u=None):
+    def rollout_ivp(self, x0, H_dstb, goal, policy_name: str, u=None, stop_fn=None, return_stop=False):
 
         if self.process == "single":
             state = self.chk_x(x0)
@@ -183,16 +183,25 @@ class sys_dynm_dd:
 
         else:
             raise ValueError(f"Unknown policy: {policy_name}")
-
+        
+        done = None
+        stop_step = None                              # (B,) step at which each row froze; -1 = never
         for k in range(H_dstb.shape[0]):
             d_k = H_dstb[k]
-            state = self.solve_ivp_fun(
-                x0=state,
-                goal=goal,
-                d=d_k,
-                control_fn=control_method,
-                u=u
-            )
+            new_state = self.solve_ivp_fun(x0=state, goal=goal, d=d_k, control_fn=control_method, u=u)
+            if stop_fn is not None:
+                new_state = np.atleast_2d(new_state)
+                if done is None:
+                    done = np.zeros(new_state.shape[0], dtype=bool)
+                    stop_step = np.full(new_state.shape[0], -1, dtype=int)
+                new_state = np.where(done[:, None], np.atleast_2d(state), new_state)
+                newly = stop_fn(new_state, d_k) & ~done
+                stop_step[newly] = k + 1              # index into trajectory (0 = x0)
+                done = done | newly
+                if self.process == "single":
+                    new_state = new_state[0]
+            state = new_state
             trajectory.append(state.copy())
 
-        return np.asarray(trajectory)
+        trajectory = np.asarray(trajectory)
+        return (trajectory, stop_step) if return_stop else trajectory

@@ -7,8 +7,8 @@ class backup_filter():
     def __init__(self, policy_class):
         super().__init__()
         self.policy_class = policy_class
-        self.obs_pos = policy_class.obs_pos
-        self.R_O = policy_class.R_O
+        self.obs_class = policy_class.obs_class     # obstacle read at the current time (frozen over the backup horizon)
+        self.R_O = policy_class.obs_class.R_O
         self.w_max = policy_class.om_max
         self.v_max = policy_class.v_max
         self.v_min = policy_class.v_min
@@ -30,7 +30,8 @@ class backup_filter():
         f_x = self.policy_class.dyn.f(x,d_nom)
         g_x = self.policy_class.dyn.G(x,d_nom)
         x_rollout, Q_rollout = self.backup_rollout(x, d_nom)
-        for i, obs in enumerate(self.obs_pos):
+        obs_pos_now = self.obs_class.pos_now()
+        for i, obs in enumerate(obs_pos_now):
             for k in range(1, len(self.tspan_b)):
                 x_k = x_rollout[k]
                 Q_k = Q_rollout[k]
@@ -106,7 +107,7 @@ class backup_filter():
         x = np.asarray(x, dtype=float).reshape(3)
         p = x[:2]
         theta = x[2]
-        diff = p[None, :] - self.obs_pos
+        diff = p[None, :] - self.obs_class.pos_now()
         dists = np.linalg.norm(diff, axis=1)
         obs_idx = int(np.argmin(dists))
         diff_closest = diff[obs_idx]

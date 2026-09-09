@@ -109,36 +109,73 @@ class v_certificate_batch:
         bv = self.vmax_batch(bHp1v_v, include_v0)                        # (B, nV)
         return bv[:, 0], bHp1_x, bHp1v_v
 
-    def get_value_and_grad_goals(self, x0, goals, horizon, include_v0,
-                                 k_cert=0.0, eps=1e-5):
-        x0    = self.sys_dynm.chk_x(x0)
-        goals = np.asarray(goals, dtype=float).reshape(-1, 2)          # (K, 2)
+    # def get_value_and_grad_goals(self, x0, goals, horizon, include_v0,
+    #                              k_cert=0.0, eps=1e-5):
+    #     x0    = self.sys_dynm.chk_x(x0)
+    #     goals = np.asarray(goals, dtype=float).reshape(-1, 2)          # (K, 2)
+    #     K, nx = goals.shape[0], self.nx
+    #     # value  W_A = mean_k max_t V(x_k(t), g_k)
+    #     W_k, bHp1_x, bHp1v_v = self._wk_goals(np.tile(x0, (K, 1)), goals,
+    #                                           horizon, include_v0, k_cert)
+
+    #     W_A = W_k.mean()
+
+    #     # floor  mean_k 0.5|p-g_k|^2 = 0.5|p-ghat|^2 + c
+    #     g_hat = goals.mean(axis=0)
+    #     c = 0.5 * np.mean(np.sum((goals - g_hat) ** 2, axis=1))
+
+    #     # gradient: central differences of W_A  (envelope thm per rollout)
+    #     E    = np.eye(nx) * eps
+    #     pert = np.concatenate([x0 + E, x0 - E], axis=0)               # (2nx, nx)
+    #     gx0  = np.repeat(pert, K, axis=0)                              # (2nx*K, nx)  [pert][goal]
+    #     gg   = np.tile(goals, (2 * nx, 1))                             # (2nx*K, 2)
+    #     gW, _, _ = self._wk_goals(gx0, gg, horizon, include_v0, k_cert)
+    #     gW   = gW.reshape(2 * nx, K).mean(axis=1)                      # (2nx,)
+    #     grad_W = (gW[:nx] - gW[nx:]) / (2.0 * eps)                     # (nx,)
+
+    #     d0  = np.zeros(self.sys_dynm.nd)
+    #     v_f = self.sys_dynm.f(x0, d0)[None]                            # (1, nx)
+    #     v_G = self.sys_dynm.G(x0, d0)[None]                            # (1, nx, nu)
+    #     vH_dstb = np.zeros((1, horizon, self.sys_dynm.nd))
+
+    #     info = {"W_k": W_k, "W_A": W_A, "c_floor": c, "g_hat": g_hat,
+    #             "bHp1_x": bHp1_x, "bHp1v_v": bHp1v_v}
+    #     return np.array([W_A]), vH_dstb, grad_W[None], v_f, v_G, info
+
+    def get_value_and_grad_goals(self, x0, goals, horizon, include_v0, k_cert=0.0, eps=1e-5):
+        x0 = self.sys_dynm.chk_x(x0)
+        goals = np.asarray(goals, dtype=float).reshape(-1, 2)
         K, nx = goals.shape[0], self.nx
 
-        # value  W_A = mean_k max_t V(x_k(t), g_k)
-        W_k, bHp1_x, bHp1v_v = self._wk_goals(np.tile(x0, (K, 1)), goals,
-                                              horizon, include_v0, k_cert)
-        W_A = W_k.mean()
+        # Rollout each candidate goal
+        W_k, bHp1_x, bHp1v_v = self._wk_goals(np.tile(x0, (K, 1)), goals, horizon, include_v0, k_cert)
 
-        # floor  mean_k 0.5|p-g_k|^2 = 0.5|p-ghat|^2 + c
+        # Outer max over goal hypotheses
+        k_star = np.argmax(W_k)
+        W_A = W_k[k_star]
+        winner_goal = goals[k_star]
+
+        # Mean goal only for diagnostics
         g_hat = goals.mean(axis=0)
-        c     = 0.5 * np.mean(np.sum((goals - g_hat) ** 2, axis=1))
+        c = 0.5 * np.mean(np.sum((goals - g_hat) ** 2, axis=1))
 
-        # gradient: central differences of W_A  (envelope thm per rollout)
-        E    = np.eye(nx) * eps
-        pert = np.concatenate([x0 + E, x0 - E], axis=0)               # (2nx, nx)
-        gx0  = np.repeat(pert, K, axis=0)                              # (2nx*K, nx)  [pert][goal]
-        gg   = np.tile(goals, (2 * nx, 1))                             # (2nx*K, 2)
-        gW, _, _ = self._wk_goals(gx0, gg, horizon, include_v0, k_cert)
-        gW   = gW.reshape(2 * nx, K).mean(axis=1)                      # (2nx,)
-        grad_W = (gW[:nx] - gW[nx:]) / (2.0 * eps)                     # (nx,)
+        # Gradient of winning goal branch
+        E = np.eye(nx) * eps
+        pert = np.concatenate([x0 + E, x0 - E], axis=0)                 # (2nx, nx)
+        gg = np.tile(winner_goal[None, :], (2 * nx, 1))                  # (2nx, 2)
+        gW, _, _ = self._wk_goals(pert, gg, horizon, include_v0, k_cert)
+        grad_W = (gW[:nx] - gW[nx:]) / (2.0 * eps)
 
-        d0  = np.zeros(self.sys_dynm.nd)
-        v_f = self.sys_dynm.f(x0, d0)[None]                            # (1, nx)
-        v_G = self.sys_dynm.G(x0, d0)[None]                            # (1, nx, nu)
+        # Dynamics
+        d0 = np.zeros(self.sys_dynm.nd)
+        v_f = self.sys_dynm.f(x0, d0)[None]
+        v_G = self.sys_dynm.G(x0, d0)[None]
         vH_dstb = np.zeros((1, horizon, self.sys_dynm.nd))
 
-        info = {"W_k": W_k, "W_A": W_A, "c_floor": c, "g_hat": g_hat,
-                "bHp1_x": bHp1_x, "bHp1v_v": bHp1v_v}
+        info = {
+            "W_k": W_k, "W_A": W_A, "k_star": k_star, "winner_goal": winner_goal,
+            "c_floor": c, "g_hat": g_hat, "bHp1_x": bHp1_x, "bHp1v_v": bHp1v_v,
+        }
+
         return np.array([W_A]), vH_dstb, grad_W[None], v_f, v_G, info
 

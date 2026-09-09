@@ -1,15 +1,15 @@
 import numpy as np
+from Get_obstacles import ObsDyn
 
 class policy:
-    def __init__(self, v_max=1.0, om_max=2.0, obs_pos=None, 
+    def __init__(self, v_max, om_max, obs_class: ObsDyn, 
                  eps=0.6, process="batch"):
         self.v_max = v_max
         self.om_max = om_max
         self.eps = eps
         self.process = process
         self.kpw = 2.0 # proportional gain for heading error
-        self.obs_pos = np.atleast_2d(obs_pos if obs_pos is not None
-                                     else np.array([2.0, 2.5]))
+        self.obs_class = obs_class          # ObsDyn: obstacle positions come from obs_class.pos_now()
         self.rng = np.random.default_rng(12345)
 
     def random_policy(self, state, goal):
@@ -52,7 +52,10 @@ class policy:
         state = np.asarray(state).reshape(-1, 3)
         p = state[:, :2]                      
         th = state[:, 2] 
-        diff = p[:, None, :] - self.obs_pos[None, :, :]    # (B, n_obs, 2)
+        # NOTE: uses the obstacle position at the CURRENT sim time for every rollout step
+        # (the policy is not told the rollout time). Approximation for moving obstacles.
+        obs_pos = self.obs_class.pos_now()                 # (n_obs, 2)
+        diff = p[:, None, :] - obs_pos[None, :, :]         # (B, n_obs, 2)
         dists = np.linalg.norm(diff, axis=2)               # (B, n_obs)
         i = np.argmin(dists, axis=1)                       # (B,)
         closest_diff = diff[np.arange(len(state)), i]      # (B, 2)
