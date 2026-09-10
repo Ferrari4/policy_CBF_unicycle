@@ -122,7 +122,6 @@ class h_certificate_batch:
         # Obstacle timeline over the rollout: same for every rollout in this control step.
         H = np.asarray(bH_dstb).shape[1]
         obs_pos, obs_vel = self.hcert_class.obs_timeline(H + 1)             # each (H+1, n_obs, 2)
-
         h_hmax, hH_dstb, info = self.compute_h_hmax(x0, bH_dstb, goal, include_h0,
                                                     obs_pos, obs_vel, max_type)
         nx, nh = self.nx, self.nh
