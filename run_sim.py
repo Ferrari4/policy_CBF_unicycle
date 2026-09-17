@@ -294,16 +294,16 @@ if __name__ == "__main__":
 
     # *1 "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
     settings = {
-        "method": "rpcbf",   # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
+        "method": "pclf_rpcbf_qp",   # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
         "x_s": [1.0, 2.8, 0.0],           # initial position [x, y, yaw]
-        "controller": "proportional_policy",  # "clf_nom" or *1
-        "h_controller": "proportional_policy",      # *1
+        "controller": "constant_policy",  # "clf_nom" or *1
+        "h_controller": "backup_policy",      # *1
         "v_controller": "proportional_policy",# *1
         "var_slack": True,
         "rollout_noise": "Zero",              # Uniform or Zero or BangBang
         "env_noise": "Zero",                  # Uniform or Zero or BangBang
         "no_obs": "single",                    # multi or single
-        "obs_static": True,
+        "obs_static": False,
         "init_goal": [4.0, 1.0],              # mean goal position
         "goal_dyn_op": "static",              # static or sin_y or random
         "goal_motion": "stoc",                # stoc or det (only for sin_y)

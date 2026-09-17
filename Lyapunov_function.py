@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.integrate import simpson
 from Dynamics import sys_dynm_dd
 
 class v_certificate:
@@ -57,7 +58,10 @@ class v_certificate:
         return np.stack([self.clf_certificate(state, goal) for state in trajectory], axis=0)
 
     def aggregate_v(self, t_values, v_values):
-        return np.max(v_values, axis=0)
+        # Policy CLF as accumulated cost:  J_T(x0) = int_0^T l(x_t) dt
+        # Simpson quadrature on the RK4 samples (4th order, matches the rollout).
+        # Requires include_v0=True so the l(x0) endpoint is part of the integral.
+        return simpson(v_values, x=t_values, axis=0)
 
     def compute_v_vmax(self, x0, bH_dstb, goal, include_v0):
         x0 = self.sys_dynm.chk_x(x0)

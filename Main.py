@@ -16,7 +16,8 @@ class policy_filter:
                  obstacles, static_obs,noise_choice, include_h0, include_v0):
         
         # Simulation parameters
-        self.T_rollout   = 1.5      # s, certificate lookahead
+        self.T_rollout   = 1.5      # s, CBF certificate lookahead
+        self.T_rollout_clf = 0.1    # s, CLF lookahead; 
         self.T_dstb_hold = 0.3      # s, piecewise-constant disturbance interval
         self.T_sim       = 100.0    # s, sim length
         self.dt          = 0.02    # s, sim step size
@@ -45,7 +46,14 @@ class policy_filter:
 
         # clf parameters
         self.slack_weight = 100
-        self.gamma = 0.1
+        self.gamma = 0.1            # only used by the hand-drawn CLF (clf_qp)
+        # Integral policy CLF  J_T(x) = int_0^T l(x_t) dt.  Exact identity along pi:
+        #     dJ_T/dt = -l(x_0) + l(x_T)
+        # clf_exact_tail=False  -> enforce  Vdot <= -l(x)          (tail dropped, assumes l(x_T) ~ 0)
+        # clf_exact_tail=True   -> enforce  Vdot <= -(l(x) - l(x_T)) (exact, always feasible with u = pi)
+        self.clf_exact_tail = False
+        self.tail_log = []          # l(x_T) / l(x_0) per P-CLF solve: evidence for dropping the tail
+        self.cert_valid_log = []
 
         self.noise_choice = noise_choice
         self.include_h0 = include_h0
@@ -53,6 +61,7 @@ class policy_filter:
         self.main_controller = controller
         
         self.horizon       = int(round(self.T_rollout / self.dt))
+        self.horizon_clf   = int(round(self.T_rollout_clf / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
         self.n_steps_sim   = int(round(self.T_sim / self.dt))
         
@@ -125,7 +134,8 @@ class policy_filter:
 
         return u.reshape(self.dyn.nu)
 
-    def noise_selection(self, override=False):
+    def noise_selection(self, override=False, horizon=None):
+        horizon = self.horizon if horizon is None else horizon
         if override == True:
             sample = 1
             if self.noise_choice=="BangBang": 
@@ -137,21 +147,21 @@ class policy_filter:
             BH_dstb_train, _ = self.train_noise.bangbang_uniform_train(
                         n_samples=self.n_samples,
                         n_samples_uniform=self.n_samples_uniform,
-                        horizon=self.horizon,
+                        horizon=horizon,
                         interval_size=self.interval_size,
                         scale=self.d_scale)
 
         elif self.noise_choice == "Uniform":
             BH_dstb_train, _ = self.train_noise.uniform_train(
                         n_samples=sample,
-                        horizon=self.horizon,
+                        horizon=horizon,
                         interval_size=self.interval_size,
                         scale=self.d_scale)
 
         elif self.noise_choice == "Zero":
             BH_dstb_train, _ = self.train_noise.zero_train(
                         n_samples=1,
-                        horizon=self.horizon,
+                        horizon=horizon,
                         interval_size=self.interval_size)
 
         else:
@@ -213,7 +223,10 @@ class policy_filter:
 
         return M, q, G, HG, pad
 
-    def _add_clf_constraint(self, G: list, HG: list, V, grad_V, f_x, g_x, use_slack):
+    def _add_clf_constraint(self, G: list, HG: list, V, grad_V, f_x, g_x, use_slack, rate=None):
+        # Enforces  grad_V (f + G u) <= -rate + delta.
+        # rate=None -> gamma*V (hand-drawn CLF).  Integral P-CLF passes rate = l(x) or l(x) - l(x_T).
+        rate = self.gamma * V if rate is None else rate
         LfV = grad_V @ f_x
         LGV = grad_V @ g_x
 
@@ -223,7 +236,7 @@ class policy_filter:
             row.append(1.0)
 
         G.append(row)
-        HG.append(LfV + self.gamma * V)
+        HG.append(LfV + rate)
 
         if use_slack:
             slack_row = [0.0] * self.dyn.nu + [1.0]
@@ -272,6 +285,24 @@ class policy_filter:
             intervening = "Not applicable"
         return u_act, intervening, delta
     
+    def _pclf_terms(self, x, goal):
+        """Integral P-CLF value/gradient plus the decrease rate the theory prescribes."""
+        v_vmax, _, grad_v, v_f, v_G, info = self.clf_batch.get_value_and_grad(
+            x, self.noise_selection(horizon=self.horizon_clf), 
+            goal, include_v0=self.include_v0)
+        V, grad_V = v_vmax[0], grad_v[0]
+        ell0 = float(self.clf.clf_certificate(x, goal)[0])       # l(x_0), the integrand now
+        ellT = float(info["vHp1v_v"][0, -1, 0])                  # l(x_T) on the worst-case rollout
+        decrease_ok = ellT < ell0                       # state inside the set where J_T is a CLF
+        if self.clf_exact_tail and decrease_ok:
+            rate = ell0 - ellT
+        else:
+            rate = ell0   
+        self.cert_valid_log.append(decrease_ok)
+        self.tail_log.append(ellT / max(ell0, 1e-12))
+
+        return V, grad_V, v_f[0], v_G[0], rate
+
     def clf_qp(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
         V = self.clf.clf_value(x, goal) # Hand drawn CLF function
@@ -326,12 +357,9 @@ class policy_filter:
 
     def pclf_qp(self, x, u_nom, goal ,use_slack):
         start_time = time.perf_counter()
-        v_vmax, _, grad_v, v_f, v_G, _ = self.clf_batch.get_value_and_grad(x, self.noise_selection(), 
-                                                                     goal, include_v0=self.include_v0)
-        V = v_vmax[0]
-        grad_V = grad_v[0]
+        V, grad_V, v_f0, v_G0, rate = self._pclf_terms(x, goal)
         M, q, G, HG, _ = self._init_qp(u_nom, use_slack=use_slack)
-        self._add_clf_constraint(G, HG, V, grad_V, v_f[0], v_G[0], use_slack=use_slack)
+        self._add_clf_constraint(G, HG, V, grad_V, v_f0, v_G0, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         try:
@@ -347,10 +375,10 @@ class policy_filter:
         Vdot = np.nan
         alV = np.nan
         if intervening != "infeasible":
-            Vdot = grad_V @ (v_f[0] + v_G[0] @ u_act)
-            alV = -self.gamma * V 
+            Vdot = grad_V @ (v_f0 + v_G0 @ u_act)
+            alV = -rate
             assert Vdot <= alV + delta + 1e-7, (
-                f"CLF violated at "
+                f"P-CLF violated at "
                 f"Vdot={Vdot:.4f}")
 
         return u_act, intervening, solve_dt, V, delta, Vdot, alV
@@ -361,15 +389,12 @@ class policy_filter:
                                                                             goal, include_h0=self.include_h0)
         dV_dt = info_h["dV_dt"]
         self.dvdt_log.append(dV_dt.copy())
-        v_vmax, _, grad_v, v_f, v_G, _ = self.clf_batch.get_value_and_grad(x, self.noise_selection(), 
-                                                                             goal, include_v0=self.include_v0)
-        V = v_vmax[0]
-        grad_V = grad_v[0]
+        V, grad_V, _, _, rate = self._pclf_terms(x, goal)
         f_x = self.dyn.f(x, d_nom)
         g_x = self.dyn.G(x, d_nom)
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
         self._add_cbf_constraints(G, HG, h_hmax, grad_h, h_f, h_G, pad, dV_dt)
-        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack)
+        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         try:
@@ -386,7 +411,7 @@ class policy_filter:
         alV = np.nan
         if intervening != "infeasible":
             Vdot = grad_V @ (f_x + g_x @ u_act)
-            alV = -self.gamma * V 
+            alV = -rate 
             assert Vdot <= alV + delta + 1e-7, (
                 f"CLF violated at "
                 f"Vdot={Vdot:.4f}")
@@ -475,14 +500,11 @@ class policy_filter:
 
     def two_step_pclf_pcbf(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
-        v_vmax, _, grad_v, v_f, v_G, _ = self.clf_batch.get_value_and_grad(x, self.noise_selection(), 
-                                                                        goal, include_v0=self.include_v0)
-        V = v_vmax[0]
-        grad_V = grad_v[0]
+        V, grad_V, _, _, rate = self._pclf_terms(x, goal)
         f_x = self.dyn.f(x, d_nom)
         g_x = self.dyn.G(x, d_nom)
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
-        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack)
+        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         # First QP block:
@@ -523,7 +545,7 @@ class policy_filter:
 
         if intervening != "infeasible":
             Vdot = grad_V @ (f_x + g_x @ u_act)
-            alV = -self.gamma * V 
+            alV = -rate 
             for j in range(len(h_hmax)):
                 hdot = grad_h[j] @ (h_f[j] + h_G[j] @ u_act) + dV_dt[j]
                 assert hdot <= -self.alpha * h_hmax[j] + 1e-7, (

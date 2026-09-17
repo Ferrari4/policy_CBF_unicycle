@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.integrate import simpson
 
 from Dynamics import sys_dynm_dd
 from Lyapunov_function import v_certificate
@@ -18,7 +19,8 @@ class v_certificate_batch:
         t_hist = np.linspace(0.0, self.sys_dynm.dt * (Vp1 - 1), Vp1)
         v_values = bh_hist if include_v0 else bh_hist[:, 1:]
         t_values = t_hist if include_v0 else t_hist[1:]
-        return np.max(v_values, axis=1)
+        # Accumulated cost J_T = int_0^T l(x_t) dt via Simpson on the rollout samples.
+        return simpson(v_values, x=t_values, axis=1)
 
     def compute_v_vmax(self, x0, bH_dstb, goal, include_v0):
         x0 = self.sys_dynm.chk_x(x0)
