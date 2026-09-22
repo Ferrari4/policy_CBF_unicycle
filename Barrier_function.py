@@ -119,10 +119,13 @@ class h_certificate:
 
         elif self.policy_h == "mixed_h":
             # h on all states, h_b replacing h at the terminal state
-            h_hist = [self.h_function(x, obs_pos[k]) for k, x in enumerate(trajectory[:-1])]
+            # h_hist = [self.h_function(x, obs_pos[k]) for k, x in enumerate(trajectory[:-1])]
+            # h_hist.append(self.h_fun_backup(trajectory[-1], obs_pos[-1], obs_vel[-1]))
+            # return np.stack(h_hist, axis=0)
+            h_hist = [self.h_function(x, obs_pos[k]) for k, x in enumerate(trajectory)]
             h_hist.append(self.h_fun_backup(trajectory[-1], obs_pos[-1], obs_vel[-1]))
-            return np.stack(h_hist, axis=0)
-
+            return np.stack(h_hist, axis=0) 
+        
         else:
             raise ValueError(f"Unknown policy_h: {self.policy_h}")
 

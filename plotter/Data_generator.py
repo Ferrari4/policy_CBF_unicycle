@@ -40,7 +40,7 @@ def save_results_to_excel(results_dict, settings, run_id=None):
         pf = results.get("safety")
         if pf is not None:
             for name in ["gamma", "alpha", "slack_weight", "v_min", "v_max", "om_max",
-                         "T_rollout", "dt", "n_samples", "d_scale"]:
+                         "T_rollout", "T_rollout_clf", "dt", "n_samples", "d_scale", "clf_exact_tail", "cbf_delta"]:
                 if hasattr(pf, name):
                     metadata.append([name, str(getattr(pf, name))])
             if hasattr(pf, "clf"):
@@ -64,6 +64,9 @@ def save_results_to_excel(results_dict, settings, run_id=None):
             "delta":  results.get("delta",  []),
             "Vdot":   results.get("Vdot",   []),
             "alV":    results.get("alV",    []),
+            "ell0":       results.get("ell0",       []),
+            "ellT":       results.get("ellT",       []),
+            "cert_valid": results.get("cert_valid", []),
         }
         series = {name: to_2d(arr) for name, arr in series.items()}
 

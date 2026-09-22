@@ -49,7 +49,7 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
 
     print_summary = True
     live_plot = False
-    early_stop = 10000
+    early_stop = 5000
 
     safety = policy_filter(controller=controller,
                            h_controller=h_controller, 
@@ -227,7 +227,7 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                     value_name={"clf": "CLF value", "pclf": "P-CLF value", "clf_cbf": "CLF value","two_step_pclf_pcbf": "P-CLF value"}.get(method, "CLF"),
                     stop_step=h_stop, dt=safety.dt)
 
-        if np.linalg.norm(goal - x_s[:2]) < 0.1:
+        if np.linalg.norm(goal - x_s[:2]) < 0.05:
             print("Goal reached!")
             print(f"final: {np.linalg.norm(init_goal - x_s[:2])}")
             print(f"compute mean: {np.linalg.norm(goal_mean - x_s[:2])}")
@@ -280,6 +280,9 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                             path=os.path.join("Results", f"{method}_V_dot_history.png"),
                             Vdot_actual=Vdot_actual,  value_label="W" if method == "pclf" else "V", 
                             title="P-CLF decrease condition" if method == "pclf" else "CLF decrease condition")
+        if len(safety.tail_log) > 0:
+            tl = np.asarray(safety.tail_log)
+            print(f"[tail l(x_T)/l(x_0)] median {np.median(tl):.3f}  90% {np.percentile(tl,90):.3f}  max {tl.max():.3f}")
 
     if live_plot:    
         plt.close("all")
@@ -288,22 +291,26 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
         
     return {"states": trajectory_actual, "inputs": applied_u, "h_now": h_now_log, "obs": obs_log,
             "h_hmax": h_hmax_log, "V": V_log, "delta": delta_log,
-            "Vdot": v_dot_log, "alV": alV_log, "safety": safety}
+            "Vdot": v_dot_log, "alV": alV_log,
+            "ell0": np.asarray(safety.ell0_log, dtype=float),
+            "ellT": np.asarray(safety.ellT_log, dtype=float),
+            "cert_valid": np.asarray(safety.cert_valid_log, dtype=float),   # 1.0 / 0.0
+            "safety": safety}
 
 if __name__ == "__main__":
 
     # *1 "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
     settings = {
-        "method": "pclf_rpcbf_qp",   # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
+        "method": "pclf",   # "rpcbf", "clf", "clf_cbf", "pclf", "pclf_goals", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
         "x_s": [1.0, 2.8, 0.0],           # initial position [x, y, yaw]
-        "controller": "constant_policy",  # "clf_nom" or *1
+        "controller": "clf_nom",  # "clf_nom" or *1
         "h_controller": "backup_policy",      # *1
-        "v_controller": "proportional_policy",# *1
+        "v_controller": "constant_policy",# *1
         "var_slack": True,
         "rollout_noise": "Zero",              # Uniform or Zero or BangBang
         "env_noise": "Zero",                  # Uniform or Zero or BangBang
         "no_obs": "single",                    # multi or single
-        "obs_static": False,
+        "obs_static": True,
         "init_goal": [4.0, 1.0],              # mean goal position
         "goal_dyn_op": "static",              # static or sin_y or random
         "goal_motion": "stoc",                # stoc or det (only for sin_y)
@@ -313,3 +320,4 @@ if __name__ == "__main__":
 
     results  = run_simulation(**settings)  
     save_results_to_excel({settings["controller"]: results}, settings)
+

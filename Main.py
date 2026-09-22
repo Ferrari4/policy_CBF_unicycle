@@ -17,10 +17,10 @@ class policy_filter:
         
         # Simulation parameters
         self.T_rollout   = 1.5      # s, CBF certificate lookahead
-        self.T_rollout_clf = 0.1    # s, CLF lookahead; 
+        self.T_rollout_clf = 3.0    # s, CLF lookahead; 
         self.T_dstb_hold = 0.3      # s, piecewise-constant disturbance interval
         self.T_sim       = 100.0    # s, sim length
-        self.dt          = 0.02    # s, sim step size
+        self.dt          = 0.01    # s, sim step size
 
         # General parameters
         self.v_max = 0.5            # m/s, max linear velocity
@@ -41,18 +41,17 @@ class policy_filter:
         # cbf parameters
         self.alpha = 2.0
         self.inter_input = 1e-3
-        cbf_delta = 0.0
+        cbf_delta = 0.5
         cbf_early_terminate = False
+        self.cbf_delta = cbf_delta
 
         # clf parameters
         self.slack_weight = 100
         self.gamma = 0.1            # only used by the hand-drawn CLF (clf_qp)
-        # Integral policy CLF  J_T(x) = int_0^T l(x_t) dt.  Exact identity along pi:
-        #     dJ_T/dt = -l(x_0) + l(x_T)
-        # clf_exact_tail=False  -> enforce  Vdot <= -l(x)          (tail dropped, assumes l(x_T) ~ 0)
-        # clf_exact_tail=True   -> enforce  Vdot <= -(l(x) - l(x_T)) (exact, always feasible with u = pi)
-        self.clf_exact_tail = False
+        self.clf_exact_tail = True
         self.tail_log = []          # l(x_T) / l(x_0) per P-CLF solve: evidence for dropping the tail
+        self.ell0_log = []        # 
+        self.ellT_log = [] 
         self.cert_valid_log = []
 
         self.noise_choice = noise_choice
@@ -300,6 +299,8 @@ class policy_filter:
             rate = ell0   
         self.cert_valid_log.append(decrease_ok)
         self.tail_log.append(ellT / max(ell0, 1e-12))
+        self.ell0_log.append(ell0)
+        self.ellT_log.append(ellT)
 
         return V, grad_V, v_f[0], v_G[0], rate
 
@@ -338,6 +339,10 @@ class policy_filter:
         start_time = time.perf_counter()
         h_hmax, _, grad_h, h_f, h_G, info = self.cert_batch.get_value_and_grad(x, self.noise_selection(),
                                                                         goal, include_h0=self.include_h0)
+
+        k_star = int(np.argmax(info["hHp1h_h"][0, :, 0]))
+        print(f"h={h_hmax[0]:+.4f} k*={k_star} omega_col={(grad_h[0] @ h_G[0])[1]:+.4f}")
+
         dV_dt = info["dV_dt"]
         self.dvdt_log.append(dV_dt.copy())
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
@@ -523,14 +528,14 @@ class policy_filter:
                                                                             goal, include_h0=self.include_h0)
         dV_dt = info_h["dV_dt"]
         self.dvdt_log.append(dV_dt.copy())
-        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
+        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=False)
         q[:self.dyn.nu] = np.asarray(u_nom, dtype=float)
         self._add_cbf_constraints(G, HG, h_hmax, grad_h, h_f, h_G, pad, dV_dt)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         # Second QP block:
         try:
-            u_act, intervening, delta = self._solve_qp(M, q, G, HG, u_nom, use_slack=use_slack)
+            u_act, intervening, delta = self._solve_qp(M, q, G, HG, u_nom, use_slack=False)
             intervening = bool(np.linalg.norm(u_act - u_nom) >= self.inter_input)
         except Exception as e:
             print("QP failed:", e)

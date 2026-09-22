@@ -34,7 +34,13 @@ class policy:
             np.cos(th_goal - th)
         )
         v = self.v_max * np.tanh(np.hypot(dx, dy))
+        
+        # d = np.hypot(dx, dy)        
+        # v = np.where(d < 0.5, 0.0, self.v_max)  
+        
         om = self.kpw * th_err
+        # om = np.where(d < 0.5, 0.0, om)  
+
         if self.process == "single":
             assert state.shape[0] == 1
             return np.array([v[0], om[0]])

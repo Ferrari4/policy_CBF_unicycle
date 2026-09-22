@@ -66,4 +66,4 @@ if __name__ == "__main__":
                 )
 
                 del results
-                progress.update(1)
+                progress.update(1)            
