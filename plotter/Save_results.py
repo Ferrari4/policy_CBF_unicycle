@@ -16,7 +16,7 @@ def save_results_to_excel(results_dict, settings, run_id=None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     suffix = "" if run_id is None else f"_run_{run_id:02d}"
 
-    output_dir = Path("plotter")
+    output_dir = Path("logs")
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = output_dir / f"simulation_{timestamp}{suffix}.xlsx"
 
@@ -39,8 +39,19 @@ def save_results_to_excel(results_dict, settings, run_id=None):
         # filter parameters that change the outcome (from the policy_filter object)
         pf = results.get("safety")
         if pf is not None:
-            for name in ["gamma", "alpha", "slack_weight", "v_min", "v_max", "om_max",
-                         "T_rollout", "T_rollout_clf", "dt", "n_samples", "d_scale", "clf_exact_tail", "cbf_delta"]:
+            for name in ["gamma", 
+                         "alpha", 
+                         "slack_weight", 
+                         "v_min", 
+                         "v_max", 
+                         "om_max",
+                         "T_rollout", 
+                         "T_rollout_clf", 
+                         "dt", 
+                         "n_samples", 
+                         "d_scale", 
+                         "clf_exact_tail", 
+                         "cbf_delta"]:
                 if hasattr(pf, name):
                     metadata.append([name, str(getattr(pf, name))])
             if hasattr(pf, "clf"):
@@ -64,6 +75,9 @@ def save_results_to_excel(results_dict, settings, run_id=None):
             "delta":  results.get("delta",  []),
             "Vdot":   results.get("Vdot",   []),
             "alV":    results.get("alV",    []),
+            "hdot":       results.get("hdot",       []),   # grad_h (f + G u_act) + dV_dt, per obstacle
+            "alH":        results.get("alH",        []),   # -alpha * h_hmax, per obstacle
+            "cbf_margin": results.get("cbf_margin", []),   # alH - hdot  (>= 0 satisfied)
             "ell0":       results.get("ell0",       []),
             "ellT":       results.get("ellT",       []),
             "cert_valid": results.get("cert_valid", []),

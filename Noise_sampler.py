@@ -20,7 +20,7 @@ class noise_train_sampler:
         n_intervals = (horizon + interval_size - 1) // interval_size
         uniform_disturbances = self.rng.uniform(low=-scale, high=scale, size=(n_samples_uniform, n_intervals, self.nd),)
         n_bangbang = n_samples - n_samples_uniform
-        bangbang_disturbances = self.rng.choice([-scale, scale], size=(n_bangbang, n_intervals, self.nd),)
+        bangbang_disturbances = self.rng.choice([-1.0, 1.0], size=(n_bangbang, n_intervals, self.nd),) * scale
         interval_disturbances = np.concatenate([uniform_disturbances, bangbang_disturbances], axis=0)
         full_disturbances = np.repeat(interval_disturbances, repeats=interval_size, axis=1,)[:, :horizon, :]
 
@@ -60,7 +60,7 @@ class noise_test_sampler:
     def bangbang_test(self, rng, k, interval_size=1, scale=1.0):
         interval = k // interval_size
         if interval != self._interval:
-            self._held = rng.choice([-scale, scale], size=(self.nd,))
+            self._held = rng.choice([-1.0, 1.0], size=(self.nd,)) * scale
             self._interval = interval
         return self._held
 

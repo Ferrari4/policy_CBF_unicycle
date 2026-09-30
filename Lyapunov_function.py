@@ -3,12 +3,17 @@ from scipy.integrate import simpson
 from Dynamics import sys_dynm_dd
 
 class v_certificate:
-    def __init__(self ,dynamic_class: sys_dynm_dd, policy_name):
+    def __init__(self, dynamic_class: sys_dynm_dd, policy_name,
+                 obs_class=None, rho_margin=0.3, k_obs=1.5, a_obs=3.0):
         self.sys_dynm = dynamic_class
         self.nx = self.sys_dynm.nx
         self.policy_name = policy_name
         self.k = 1.0
         self.nV = 1  
+        self.obs_class  = obs_class     # ObsDyn or None (None -> original V)
+        self.rho_margin = rho_margin    # influence radius = R_O + rho_margin
+        self.k_obs      = k_obs
+        self.a_obs      = a_obs
 
     def get_params(self, x, goal): # Batch ready
         x, goal = np.asarray(x), np.asarray(goal)
@@ -49,7 +54,25 @@ class v_certificate:
         # V = 0.5 * d**2 + k * (1.0 - np.cos(theta_err))
         # V = 0.5 * d**2 * (1.0 + k * (1.0 - np.cos(theta_err)))
         V = d**2 + (0.5 * (theta_err**2))
+        # V = d
         return V[..., None]
+    
+    # def clf_certificate(self, x, goal, k=None): # Batch ready
+    #     k = self.k if k is None else k
+    #     _, _, d, theta_err = self.get_params(x, goal)
+    #     V = d**2 + (0.5 * (theta_err**2))
+    #     if self.obs_class is not None:
+    #         x = np.asarray(x)
+    #         obs_pos = self.obs_class.pos_now()                      # (n_obs, 2)
+    #         rho0    = self.obs_class.R_O + self.rho_margin          # (n_obs,)
+    #         rho  = np.hypot(x[..., None, 0] - obs_pos[:, 0],
+    #                         x[..., None, 1] - obs_pos[:, 1])        # (..., n_obs)
+    #         clearance = rho - self.obs_class.R_O
+    #         viol = np.maximum(1.0 - clearance / self.rho_margin, 0.0)
+    #         V = V + self.k_obs * np.sum(
+    #             np.expm1(self.a_obs * viol**2), axis=-1
+    #         )
+    #     return V[..., None]
 
     def evaluate_v_trajectory(self, trajectory, goal):
         if trajectory.ndim != 2:

@@ -14,7 +14,7 @@ from Noise_sampler import noise_train_sampler, noise_test_sampler
 class policy_filter:
     def __init__(self, controller,h_controller, v_controller, 
                  obstacles, static_obs,noise_choice, include_h0, include_v0):
-        
+
         # Simulation parameters
         self.T_rollout   = 1.5      # s, CBF certificate lookahead
         self.T_rollout_clf = 3.0    # s, CLF lookahead; 
@@ -30,27 +30,30 @@ class policy_filter:
         # obstacles parameters
         radius_to_inflate = 0.0
         amplitude = 0.5
-        frequency = 2
+        frequency = 8
         phase = 0.0
 
         # Noise parameters
         self.n_samples = 50
         self.n_samples_uniform = 25
-        self.d_scale = 0.05
+        rho = 0.05
+        self.d_scale = rho * np.array([self.v_max, self.v_max, self.om_max])
 
         # cbf parameters
         self.alpha = 2.0
-        self.inter_input = 1e-3
+        self.inter_input = 1e-9
         cbf_delta = 0.5
         cbf_early_terminate = False
         self.cbf_delta = cbf_delta
+        self.hdot_log = []   # grad_h (f + G u_act) + dV_dt, one (nh,) row per CBF solve
+        self.alh_log  = []   # -alpha * h_hmax, the rate the constraint demanded
 
         # clf parameters
         self.slack_weight = 100
-        self.gamma = 0.1            # only used by the hand-drawn CLF (clf_qp)
+        self.gamma = 1.0            # only used by the hand-drawn CLF (clf_qp)
         self.clf_exact_tail = True
         self.tail_log = []          # l(x_T) / l(x_0) per P-CLF solve: evidence for dropping the tail
-        self.ell0_log = []        # 
+        self.ell0_log = []          
         self.ellT_log = [] 
         self.cert_valid_log = []
 
@@ -58,12 +61,12 @@ class policy_filter:
         self.include_h0 = include_h0
         self.include_v0 = include_v0
         self.main_controller = controller
-        
+ 
         self.horizon       = int(round(self.T_rollout / self.dt))
         self.horizon_clf   = int(round(self.T_rollout_clf / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
         self.n_steps_sim   = int(round(self.T_sim / self.dt))
-        
+
         self.obs_class = ObsDyn(layout=obstacles,
                                 static=static_obs,
                                 dt=self.dt,
@@ -71,38 +74,40 @@ class policy_filter:
                                 amplitude=amplitude, 
                                 freq=frequency, 
                                 phi=phase)
-            
+
         self.policy = policy(v_max=self.v_max, 
                              om_max=self.om_max,
                              obs_class=self.obs_class, 
                              eps=0.6,  
                              process="batch")
-             
+
         self.dyn = sys_dynm_dd(policy_class=self.policy, 
                                dt=self.dt, 
                                ivp_method="manual_RK4",
                                process="batch")
-        
+
         self.cert = h_certificate(dynamic_class=self.dyn,
                                   obs_class=self.obs_class, 
                                   policy_h="policy_h",
                                   policy_name=h_controller,
                                   delta = cbf_delta)
 
-        self.cert_batch = h_certificate_batch(dynamic_class=self.dyn, 
+        self.cert_batch = h_certificate_batch(dynamic_class=self.dyn,
                                             obs_class=self.obs_class,
                                             hcert_class=self.cert,
                                             terminate_on_hb=cbf_early_terminate)
 
         self.clf = v_certificate(dynamic_class=self.dyn, 
-                                 policy_name=v_controller)
+                                 policy_name=v_controller,
+                                 obs_class=self.obs_class)
 
         self.clf_batch = v_certificate_batch(dynamic_class=self.dyn, 
                                              vfun_class=self.clf)
 
         self.dvdt_log = []          # dV/dt from the moving obstacle, one entry per CBF solve
-        self.rng = np.random.default_rng(12345)
-        self.test_noise = noise_test_sampler(nd=self.dyn.nd, rng=self.rng)
+        self.rng = np.random.default_rng(12345)          # rollouts / certificates (unchanged)
+        self.env_rng = np.random.default_rng(54321)      # environment disturbance only
+        self.test_noise = noise_test_sampler(nd=self.dyn.nd, rng=self.env_rng)
         self.train_noise = noise_train_sampler(nd=self.dyn.nd, rng=self.rng)
 
     def u_nominal(self, x, controller, goal):
@@ -142,6 +147,7 @@ class policy_filter:
         else:
             sample = self.n_samples
 
+
         if self.noise_choice == "BangBang":
             BH_dstb_train, _ = self.train_noise.bangbang_uniform_train(
                         n_samples=self.n_samples,
@@ -167,15 +173,23 @@ class policy_filter:
             raise ValueError(f"Invalid noise_choice: {self.noise_choice}. Must be \
                              'BangBang', 'Uniform', or 'Zero'.")       
 
+        # d_int = BH_dstb_train[:, ::self.interval_size, :]          # (n_samples, n_intervals, nd)
+        # print(f"[{self.noise_choice}] full {BH_dstb_train.shape}  per-interval {d_int.shape}")
+        # print("d_scale        :", np.asarray(self.d_scale))
+        # print("max|d| per comp:", np.abs(BH_dstb_train).max(axis=(0, 1)))
+        # with np.printoptions(precision=3, suppress=True):
+        #     print(d_int)
+        # return BH_dstb_train
+
         return BH_dstb_train
 
     def noise_single(self, env_noise, index):
         if env_noise == "Uniform":
-            d_env = self.test_noise.uniform_test(rng=self.rng, scale=self.d_scale)
+            d_env = self.test_noise.uniform_test(rng=self.env_rng, scale=self.d_scale)
         elif env_noise == "Zero":
             d_env = self.test_noise.zero_test()
         elif env_noise == "BangBang":
-            d_env = self.test_noise.bangbang_test(rng=self.rng, k=index, 
+            d_env = self.test_noise.bangbang_test(rng=self.env_rng, k=index, 
                                                   interval_size=self.interval_size, scale=self.d_scale)
         else:
             raise ValueError(f"Unknown environment noise: {env_noise}")
@@ -202,7 +216,7 @@ class policy_filter:
         q = np.zeros(n_z)
         if self.main_controller != "clf_nom":       
             q[:nu] = np.asarray(u_nom, dtype=float)
-         
+
         def pad(row):
             return list(row) + ([0.0] if use_slack else [])
 
@@ -283,16 +297,17 @@ class policy_filter:
         else:
             intervening = "Not applicable"
         return u_act, intervening, delta
-    
+
     def _pclf_terms(self, x, goal):
         """Integral P-CLF value/gradient plus the decrease rate the theory prescribes."""
         v_vmax, _, grad_v, v_f, v_G, info = self.clf_batch.get_value_and_grad(
             x, self.noise_selection(horizon=self.horizon_clf), 
             goal, include_v0=self.include_v0)
-        V, grad_V = v_vmax[0], grad_v[0]
-        ell0 = float(self.clf.clf_certificate(x, goal)[0])       # l(x_0), the integrand now
+        V_max, grad_V = v_vmax[0], grad_v[0]                     # worst-case cumulative cost (gradient source)
+        V = float(self.clf.clf_certificate(x, goal)[0])          # instantaneous V(x_t), like h_now
+        ell0 = V                                                 # l(x_0) == V(x_t): the integrand now
         ellT = float(info["vHp1v_v"][0, -1, 0])                  # l(x_T) on the worst-case rollout
-        decrease_ok = ellT < ell0                       # state inside the set where J_T is a CLF
+        decrease_ok = ellT < ell0       
         if self.clf_exact_tail and decrease_ok:
             rate = ell0 - ellT
         else:
@@ -302,7 +317,33 @@ class policy_filter:
         self.ell0_log.append(ell0)
         self.ellT_log.append(ellT)
 
-        return V, grad_V, v_f[0], v_G[0], rate
+        return V_max, grad_V, v_f[0], v_G[0], rate, V
+
+    def _cbf_terms(self, h_values, grad_h, h_f, h_G, dV_dt, u_act, check=True):
+        """hdot along u_act and the required rate -alpha*h, both (nh,). Always logs one row.
+        Constraint:  hdot <= -alpha h   (h <= 0 safe).   margin = -alpha h - hdot  >= 0.
+        """
+        h_values = np.atleast_1d(np.asarray(h_values, dtype=float))
+        nh = h_values.shape[0]
+        if u_act is None:                              # QP infeasible
+            hdot = np.full(nh, np.nan)
+            alh  = np.full(nh, np.nan)
+        else:
+            hdot = np.array([grad_h[j] @ (h_f[j] + h_G[j] @ u_act) + dV_dt[j]
+                             for j in range(nh)])
+            alh  = -self.alpha * h_values
+        self.hdot_log.append(hdot)
+        self.alh_log.append(alh)
+        if u_act is not None and check:
+            for j in range(nh):
+                assert hdot[j] <= alh[j] + 1e-7, (
+                    f"CBF row {j} violated at hdot={hdot[j]:.4f} > -alpha*h={alh[j]:.4f}")
+        return hdot, alh
+
+    def _log_cbf_nan(self):
+        """Placeholder row when a step ends before the CBF certificate is evaluated."""
+        self.hdot_log.append(np.full(self.cert.nh, np.nan))
+        self.alh_log.append(np.full(self.cert.nh, np.nan))
 
     def clf_qp(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
@@ -332,7 +373,6 @@ class policy_filter:
             assert Vdot <= alV + delta + 1e-7, (
                 f"CLF violated at "
                 f"Vdot={Vdot:.4f}")
-            
         return u_act, intervening, solve_dt, V, delta, Vdot, alV
 
     def rpcbf_qp(self, x, u_nom, goal, use_slack):
@@ -356,15 +396,19 @@ class policy_filter:
             u_act = np.zeros(self.dyn.nu)
             intervening = "infeasible"
 
+        # hdot / -alpha*h along the applied input (NaN row if infeasible). Outside the try on purpose.
+        self._cbf_terms(h_hmax, grad_h, h_f, h_G, dV_dt,
+                        None if intervening == "infeasible" else u_act)
+
         solve_dt = time.perf_counter() - start_time
 
         return u_act, intervening, solve_dt, h_hmax, info["h_stop_step"]
 
     def pclf_qp(self, x, u_nom, goal ,use_slack):
         start_time = time.perf_counter()
-        V, grad_V, v_f0, v_G0, rate = self._pclf_terms(x, goal)
+        V_max, grad_V, v_f0, v_G0, rate, V = self._pclf_terms(x, goal)
         M, q, G, HG, _ = self._init_qp(u_nom, use_slack=use_slack)
-        self._add_clf_constraint(G, HG, V, grad_V, v_f0, v_G0, use_slack=use_slack, rate=rate)
+        self._add_clf_constraint(G, HG, V_max, grad_V, v_f0, v_G0, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         try:
@@ -386,20 +430,18 @@ class policy_filter:
                 f"P-CLF violated at "
                 f"Vdot={Vdot:.4f}")
 
-        return u_act, intervening, solve_dt, V, delta, Vdot, alV
+        return u_act, intervening, solve_dt, V_max, delta, Vdot, alV, V
 
-    def pclf_rpcbf_qp(self, x, u_nom, d_nom, goal, use_slack):
+    def pclf_rpcbf_qp(self, x, u_nom, goal, use_slack):
         start_time = time.perf_counter()
         h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection(), 
                                                                             goal, include_h0=self.include_h0)
+        V_max, grad_V, v_f0, v_G0, rate, V = self._pclf_terms(x, goal)
         dV_dt = info_h["dV_dt"]
         self.dvdt_log.append(dV_dt.copy())
-        V, grad_V, _, _, rate = self._pclf_terms(x, goal)
-        f_x = self.dyn.f(x, d_nom)
-        g_x = self.dyn.G(x, d_nom)
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
         self._add_cbf_constraints(G, HG, h_hmax, grad_h, h_f, h_G, pad, dV_dt)
-        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
+        self._add_clf_constraint(G, HG, V_max, grad_V, v_f0, v_G0, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         try:
@@ -410,26 +452,22 @@ class policy_filter:
             intervening = "infeasible"
             delta = 0.0
 
+        # hdot / -alpha*h along the applied input (NaN row if infeasible). Replaces the old assert loop.
+        self._cbf_terms(h_hmax, grad_h, h_f, h_G, dV_dt,
+                        None if intervening == "infeasible" else u_act)
+
         solve_dt = time.perf_counter() - start_time
 
         Vdot = np.nan
         alV = np.nan
         if intervening != "infeasible":
-            Vdot = grad_V @ (f_x + g_x @ u_act)
+            Vdot = grad_V @ (v_f0 + v_G0 @ u_act)
             alV = -rate 
             assert Vdot <= alV + delta + 1e-7, (
                 f"CLF violated at "
                 f"Vdot={Vdot:.4f}")
 
-            for j in range(len(h_hmax)):
-                hdot = grad_h[j] @ (h_f[j] + h_G[j] @ u_act) + dV_dt[j]
-                assert hdot <= -self.alpha * h_hmax[j] + 1e-7, (
-                    f"CBF row {j} "
-                    f"violated at "
-                    f"hdot={hdot:.4f}"
-                )
-
-        return u_act, intervening, solve_dt, V, delta, h_hmax, Vdot, alV
+        return u_act, intervening, solve_dt, V_max, delta, h_hmax, Vdot, alV, V
 
     def clf_cbf_qp(self, x, u_nom, d_nom, goal, use_slack):
         start_time = time.perf_counter()
@@ -454,6 +492,10 @@ class policy_filter:
             intervening = "infeasible"
             delta = 0.0
 
+        # hdot / -alpha*h along the applied input (NaN row if infeasible). Replaces the old assert loop.
+        self._cbf_terms(h_hmax, grad_h, h_f, h_G, dV_dt,
+                        None if intervening == "infeasible" else u_act)
+
         solve_dt = time.perf_counter() - start_time
 
         Vdot = np.nan
@@ -464,14 +506,6 @@ class policy_filter:
             assert Vdot <= alV + delta + 1e-7, (
                 f"CLF violated at "
                 f"Vdot={Vdot:.4f}")
-
-            for j in range(len(h_hmax)):
-                hdot = grad_h[j] @ (h_f[j] + h_G[j] @ u_act) + dV_dt[j]
-                assert hdot <= -self.alpha * h_hmax[j] + 1e-7, (
-                    f"CBF row {j} "
-                    f"violated at "
-                    f"hdot={hdot:.4f}"
-                )
 
         return u_act, intervening, solve_dt, V, delta, h_hmax, Vdot, alV
 
@@ -503,13 +537,11 @@ class policy_filter:
 
         return u_act, intervening, solve_dt, V, delta, Vdot, alV
 
-    def two_step_pclf_pcbf(self, x, u_nom, d_nom, goal, use_slack):
+    def two_step_pclf_pcbf(self, x, u_nom, goal, use_slack):
         start_time = time.perf_counter()
-        V, grad_V, _, _, rate = self._pclf_terms(x, goal)
-        f_x = self.dyn.f(x, d_nom)
-        g_x = self.dyn.G(x, d_nom)
+        V_max, grad_V, v_f0, v_G0, rate, V = self._pclf_terms(x, goal)
         M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
-        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
+        self._add_clf_constraint(G, HG, V_max, grad_V, v_f0, v_G0, use_slack=use_slack, rate=rate)
         G, HG = self._finalize_constraints(G, HG, M.shape[0])
 
         # First QP block:
@@ -521,10 +553,12 @@ class policy_filter:
             intervening = "infeasible"
             delta = 0.0
             solve_dt = time.perf_counter() - start_time
+            self._log_cbf_nan()          # CBF never evaluated this step: keep logs aligned
 
-            return u_act, intervening, solve_dt, V, delta, np.full(self.cert.nh, np.nan) , np.nan, np.nan 
+            return (u_act, intervening, solve_dt, V_max, delta,
+                    np.full(self.cert.nh, np.nan), np.nan, np.nan, V)
 
-        h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection(), 
+        h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection(),
                                                                             goal, include_h0=self.include_h0)
         dV_dt = info_h["dV_dt"]
         self.dvdt_log.append(dV_dt.copy())
@@ -543,20 +577,16 @@ class policy_filter:
             intervening = "infeasible"
             delta = 0.0
 
+        # hdot / -alpha*h along the applied input (NaN row if infeasible). Replaces the old assert loop.
+        self._cbf_terms(h_hmax, grad_h, h_f, h_G, dV_dt,
+                        None if intervening == "infeasible" else u_act)
+
         solve_dt = time.perf_counter() - start_time
-        
         Vdot = np.nan
         alV = np.nan
 
         if intervening != "infeasible":
-            Vdot = grad_V @ (f_x + g_x @ u_act)
+            Vdot = grad_V @ (v_f0 + v_G0 @ u_act)
             alV = -rate 
-            for j in range(len(h_hmax)):
-                hdot = grad_h[j] @ (h_f[j] + h_G[j] @ u_act) + dV_dt[j]
-                assert hdot <= -self.alpha * h_hmax[j] + 1e-7, (
-                    f"CBF row {j} "
-                    f"violated at "
-                    f"hdot={hdot:.4f}"
-                )
 
-        return u_act, intervening, solve_dt, V, delta_clf, h_hmax, Vdot, alV
+        return u_act, intervening, solve_dt, V_max, delta_clf, h_hmax, Vdot, alV, V

@@ -2,7 +2,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from Main import run_simulation
-from plotter.Data_generator import save_results_to_excel 
+from plotter.Save_results import save_results_to_excel 
 
 
 def run_one(settings):

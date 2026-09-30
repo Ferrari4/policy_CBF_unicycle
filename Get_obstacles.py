@@ -66,6 +66,15 @@ class ObsDyn:
             obs_vel = self.vel(t_roll)                 # (H, n_obs, 2)
         return obs_pos, self.R_O, obs_vel
 
+def check_collision(state, obs_class, robot_radius=0.0):
+    """Return (collided, min_clearance, obstacle_index).
+    Clearance = centre distance - (R_O + robot_radius); negative means overlap."""
+    p = np.asarray(state[:2], dtype=float)
+    obs_pos = np.asarray(obs_class.pos_now()).reshape(-1, 2)
+    radii = np.broadcast_to(np.asarray(obs_class.R_O).reshape(-1), (len(obs_pos),))
+    clearance = np.hypot(*(obs_pos - p).T) - (radii + robot_radius)
+    j = int(np.argmin(clearance))
+    return bool(clearance[j] < 0.0), float(clearance[j]), j
 
 if __name__ == "__main__":
     obs = ObsDyn("multi", static=False, dt=0.1, amplitude=0.5, freq=2.0)

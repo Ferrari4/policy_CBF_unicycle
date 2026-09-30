@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 Results/
 Generated results/
+plotter/save_results/
 check.py
 *.png
 .vscode/
