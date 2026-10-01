@@ -12,40 +12,39 @@ from Lyapunov_function_batch import v_certificate_batch
 from Noise_sampler import noise_train_sampler, noise_test_sampler
 
 class policy_filter:
-    def __init__(self, controller,h_controller, v_controller, 
-                 obstacles, static_obs, noise_choice_cbf, noise_choice_clf,
-                 include_h0, include_v0):
+    def __init__(self, controller, h_controller, v_controller,
+                obstacles, static_obs, noise_choice_cbf, noise_choice_clf,
+                include_h0, include_v0, T_rollout=None, T_rollout_clf=None):
 
         # Simulation parameters
-        self.T_rollout   = 1.5      # s, CBF certificate lookahead
-        self.T_rollout_clf = 3.0    # s, CLF lookahead; 
+        self.T_rollout     = 1.5 if T_rollout is None else float(T_rollout) # CBF
+        self.T_rollout_clf = 3.0 if T_rollout_clf is None else float(T_rollout_clf) # CLF
         self.T_dstb_hold = 0.3      # s, piecewise-constant disturbance interval
         self.T_sim       = 100.0    # s, sim length
         self.dt          = 0.01    # s, sim step size
 
         # General parameters
-        self.v_max = 3.0            # m/s, max linear velocity
+        self.v_max = 0.5            # m/s, max linear velocity
         self.v_min = 0.1            # m/s, min linear velocity, applied more so for the QP
         self.om_max = 3.0           # rad/s, max angular velocity
 
         # obstacles parameters
-        radius_to_inflate = 0.0
-        amplitude = 0.5
-        frequency = 8
-        phase = 0.0
+        self.radius_to_inflate = 0.0
+        self.obs_amplitude = 0.5
+        self.obs_frequency = 8
+        self.obs_phase = 0.0
 
         # Noise parameters
         self.n_samples = 50
         self.n_samples_uniform = 25
-        rho = 0.2
-        self.d_scale = rho * np.array([self.v_max, self.v_max, self.om_max])
+        self.rho = 0.2
+        self.d_scale = self.rho * np.array([self.v_max, self.v_max, self.om_max])
 
         # cbf parameters
         self.alpha = 2.0
         self.inter_input = 1e-3
-        cbf_delta = 0.5
-        cbf_early_terminate = False
-        self.cbf_delta = cbf_delta
+        self.cbf_delta = 0.5
+        self.cbf_early_terminate = False
         self.hdot_log = []   # grad_h (f + G u_act) + dV_dt, one (nh,) row per CBF solve
         self.alh_log  = []   # -alpha * h_hmax, the rate the constraint demanded
         self.cbf_active_log = []   # bool per CBF solve: CBF multiplier > 0
@@ -56,16 +55,26 @@ class policy_filter:
         self.slack_weight = 100
         self.clf_exact_tail = True
         self.tail_log = []          # l(x_T) / l(x_0) per P-CLF solve: evidence for dropping the tail
-        self.ell0_log = []          
-        self.ellT_log = [] 
+        self.ell0_log = []
+        self.ellT_log = []
         self.cert_valid_log = []
 
+        # policy / dynamics settings
+        self.policy_eps = 0.6
+        self.ivp_method = "manual_RK4"
+        self.process    = "batch"
+
+        # inputs (stored for logging)
         self.noise_choice_cbf = noise_choice_cbf
         self.noise_choice_clf = noise_choice_clf
         self.include_h0 = include_h0
         self.include_v0 = include_v0
         self.main_controller = controller
- 
+        self.h_controller = h_controller
+        self.v_controller = v_controller
+        self.obstacles_layout = obstacles
+        self.static_obs = static_obs
+
         self.horizon   = int(round(self.T_rollout / self.dt))
         self.horizon_clf   = int(round(self.T_rollout_clf / self.dt))
         self.interval_size = int(round(self.T_dstb_hold / self.dt))
@@ -74,45 +83,80 @@ class policy_filter:
         self.obs_class = ObsDyn(layout=obstacles,
                                 static=static_obs,
                                 dt=self.dt,
-                                barrier_inflate=radius_to_inflate, 
-                                amplitude=amplitude, 
-                                freq=frequency, 
-                                phi=phase)
+                                barrier_inflate=self.radius_to_inflate,
+                                amplitude=self.obs_amplitude,
+                                freq=self.obs_frequency,
+                                phi=self.obs_phase)
 
-        self.policy = policy(v_max=self.v_max, 
+        self.policy = policy(v_max=self.v_max,
                              om_max=self.om_max,
-                             obs_class=self.obs_class, 
-                             eps=0.6,  
-                             process="batch")
+                             obs_class=self.obs_class,
+                             eps=self.policy_eps,
+                             process=self.process)
 
-        self.dyn = sys_dynm_dd(policy_class=self.policy, 
-                               dt=self.dt, 
-                               ivp_method="manual_RK4",
-                               process="batch")
+        self.dyn = sys_dynm_dd(policy_class=self.policy,
+                               dt=self.dt,
+                               ivp_method=self.ivp_method,
+                               process=self.process)
 
         self.cert = h_certificate(dynamic_class=self.dyn,
-                                  obs_class=self.obs_class, 
+                                  obs_class=self.obs_class,
                                   policy_h="policy_h",
                                   policy_name=h_controller,
-                                  delta = cbf_delta)
+                                  delta=self.cbf_delta)
 
         self.cert_batch = h_certificate_batch(dynamic_class=self.dyn,
                                             obs_class=self.obs_class,
                                             hcert_class=self.cert,
-                                            terminate_on_hb=cbf_early_terminate)
+                                            terminate_on_hb=self.cbf_early_terminate)
 
-        self.clf = v_certificate(dynamic_class=self.dyn, 
+        self.clf = v_certificate(dynamic_class=self.dyn,
                                  policy_name=v_controller,
                                  obs_class=self.obs_class)
 
-        self.clf_batch = v_certificate_batch(dynamic_class=self.dyn, 
+        self.clf_batch = v_certificate_batch(dynamic_class=self.dyn,
                                              vfun_class=self.clf)
 
         self.dvdt_log = []          # dV/dt from the moving obstacle, one entry per CBF solve
-        self.rng = np.random.default_rng(12345)          # rollouts / certificates (unchanged)
-        self.env_rng = np.random.default_rng(54321)      # environment disturbance only
+        self.seed_cert = 12345
+        self.seed_env  = 54321
+        self.rng = np.random.default_rng(self.seed_cert)        # rollouts / certificates (unchanged)
+        self.env_rng = np.random.default_rng(self.seed_env)     # environment disturbance only
         self.test_noise = noise_test_sampler(nd=self.dyn.nd, rng=self.env_rng)
         self.train_noise = noise_train_sampler(nd=self.dyn.nd, rng=self.rng)
+
+    def params(self):
+        """Every setting this filter ran with, as plain scalars/strings, for logging next to results."""
+        return dict(
+            # timing / horizons
+            T_rollout=self.T_rollout, T_rollout_clf=self.T_rollout_clf, T_dstb_hold=self.T_dstb_hold,
+            T_sim=self.T_sim, dt=self.dt, horizon=self.horizon, horizon_clf=self.horizon_clf,
+            interval_size=self.interval_size, n_steps_sim=self.n_steps_sim,
+            # input limits
+            v_max=self.v_max, v_min=self.v_min, om_max=self.om_max,
+            # CBF
+            alpha=self.alpha, cbf_delta=self.cbf_delta, cbf_early_terminate=self.cbf_early_terminate,
+            inter_input=self.inter_input, include_h0=self.include_h0,
+            # CLF
+            gamma=self.gamma, slack_weight=self.slack_weight, clf_exact_tail=self.clf_exact_tail,
+            include_v0=self.include_v0,
+            # disturbance model
+            n_samples=self.n_samples, n_samples_uniform=self.n_samples_uniform, rho=self.rho,
+            d_scale_x=float(self.d_scale[0]), d_scale_y=float(self.d_scale[1]), d_scale_th=float(self.d_scale[2]),
+            noise_choice_cbf=self.noise_choice_cbf, noise_choice_clf=self.noise_choice_clf,
+            # policies
+            main_controller=self.main_controller, h_controller=self.h_controller, v_controller=self.v_controller,
+            policy_eps=self.policy_eps, ivp_method=self.ivp_method, process=self.process,
+            # obstacles
+            obstacles_layout=self.obstacles_layout, static_obs=self.static_obs,
+            radius_to_inflate=self.radius_to_inflate, obs_amplitude=self.obs_amplitude,
+            obs_frequency=self.obs_frequency, obs_phase=self.obs_phase,
+            n_obs=int(len(self.obs_class.R_O)),
+            obs_centres=";".join(f"{c[0]:.4f},{c[1]:.4f}" for c in np.asarray(self.obs_class.pos_now())),
+            obs_radii=";".join(f"{r:.4f}" for r in np.asarray(self.obs_class.R_O)),
+            # seeds
+            seed_cert=self.seed_cert, seed_env=self.seed_env,
+        )
 
     def u_nominal(self, x, controller, goal):
         if controller == "proportional_policy":
@@ -199,7 +243,7 @@ class policy_filter:
             M[nu, nu] = self.slack_weight
 
         q = np.zeros(n_z)
-        if self.main_controller != "clf_nom":       
+        if self.main_controller != "clf_nom":
             q[:nu] = np.asarray(u_nom, dtype=float)
 
         def pad(row):
@@ -294,17 +338,17 @@ class policy_filter:
     def _pclf_terms(self, x, goal):
         """Integral P-CLF value/gradient plus the decrease rate the theory prescribes."""
         v_vmax, _, grad_v, v_f, v_G, info = self.clf_batch.get_value_and_grad(
-            x, self.noise_selection_clf(horizon=self.horizon_clf), 
+            x, self.noise_selection_clf(horizon=self.horizon_clf),
             goal, include_v0=self.include_v0)
         V_max, grad_V = v_vmax[0], grad_v[0]                     # worst-case cumulative cost (gradient source)
         V = float(self.clf.clf_certificate(x, goal)[0])          # instantaneous V(x_t), like h_now
         ell0 = V                                                 # l(x_0) == V(x_t): the integrand now
         ellT = float(info["vHp1v_v"][0, -1, 0])                  # l(x_T) on the worst-case rollout
-        decrease_ok = ellT < ell0       
+        decrease_ok = ellT < ell0
         if self.clf_exact_tail and decrease_ok:
             rate = ell0 - ellT
         else:
-            rate = ell0   
+            rate = ell0
         self.cert_valid_log.append(decrease_ok)
         self.tail_log.append(ellT / max(ell0, 1e-12))
         self.ell0_log.append(ell0)
@@ -399,7 +443,7 @@ class policy_filter:
 
     def pclf_rpcbf_qp(self, x, u_nom, goal, use_slack):
         start_time = time.perf_counter()
-        h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection_cbf(), 
+        h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection_cbf(),
                                                                             goal, include_h0=self.include_h0)
         V_max, grad_V, v_f0, v_G0, rate, V = self._pclf_terms(x, goal)
         dV_dt = info_h["dV_dt"]
@@ -430,7 +474,7 @@ class policy_filter:
         alV = np.nan
         if intervening != "infeasible":
             Vdot = grad_V @ (v_f0 + v_G0 @ u_act)
-            alV = -rate 
+            alV = -rate
             assert Vdot <= alV + delta + 1e-7, (
                 f"CLF violated at "
                 f"Vdot={Vdot:.4f}")
@@ -490,7 +534,6 @@ class policy_filter:
 
         if intervening != "infeasible":
             Vdot = grad_V @ (v_f0 + v_G0 @ u_act)
-            alV = -rate 
+            alV = -rate
 
         return u_act, intervening, solve_dt, V_max, delta_clf, h_hmax, Vdot, alV, V, u_nom
-    

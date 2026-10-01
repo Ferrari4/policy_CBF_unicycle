@@ -1,5 +1,6 @@
 import os, glob
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from Main import policy_filter
@@ -12,6 +13,14 @@ from plotter.Save_results import save_results_to_excel
 from plotter.Plot_results import (plot_trajectories, plot_h_history, 
 plot_v_history, plot_vdot_history, plot_hdot_history)
 
+def append_params_sheet(xlsx_path, params, sheet="params"):
+    """Add/replace a key-value sheet of run parameters in an existing workbook."""
+    flat = {k: (",".join(f"{v:.4f}" for v in val) if isinstance(val, (list, tuple, np.ndarray)) else val)
+            for k, val in params.items()}
+    df = pd.Series(flat, name="value").rename_axis("parameter").reset_index()
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+        df.to_excel(xw, sheet_name=sheet, index=False)
+
 def clear_results(results_dir="plotter/Results", pattern="*.png"):
     os.makedirs(results_dir, exist_ok=True)
     for f in glob.glob(os.path.join(results_dir, pattern)):
@@ -19,8 +28,9 @@ def clear_results(results_dir="plotter/Results", pattern="*.png"):
 
 def print_step_summary(kk, x, u_nom, u_act, solve_dt, intervening,
                        goal=None, h_values=None, V=None, delta=None, value_name="CLF",
-                       stop_step=None, dt=None, hdot=None, alh=None, V_max=None):
-    
+                       stop_step=None, dt=None, hdot=None, alh=None, V_max=None,
+                       J_u=None, J_int=None, cbf_on=None):
+
     status = (
         "INTERVENE" if intervening is True
         else intervening if isinstance(intervening, str)
@@ -50,6 +60,11 @@ def print_step_summary(kk, x, u_nom, u_act, solve_dt, intervening,
         if delta is not None:
             v_str += f"   slack = {delta:8.4f}"
         lines.append(f"  {value_name:<15}: {v_str}")
+    if J_u is not None:
+        e_str = f"J_u = {J_u:7.4f} s"
+        if J_int is not None:
+            e_str += f"   J_int = {J_int:7.4f} s   CBF {'ACTIVE' if cbf_on else 'idle'}"
+        lines.append(f"  Effort (cum.)  : {e_str}")
     lines.append(f"  Solve time     : {solve_dt * 1000:.2f} ms")
     lines.append(f"  Status         : {status}")
     if goal is not None:
@@ -60,14 +75,14 @@ def print_step_summary(kk, x, u_nom, u_act, solve_dt, intervening,
         lines.append(f"  Rollout stop   : [{s}]")
     print("\n".join(lines))
 
-def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slack, 
-                   rollout_noise_cbf, rollout_noise_clf,env_noise, no_obs, obs_static,
-                   init_goal, goal_dyn_op, goal_motion, include_h0, include_v0, det_collison, make_plots, early_stop):
+def run_simulation(method, x_s, controller, h_controller, v_controller, var_slack,
+                   rollout_noise_cbf, rollout_noise_clf, env_noise, no_obs, obs_static,
+                   init_goal, goal_dyn_op, goal_motion, include_h0, include_v0, det_collison, make_plots, early_stop,
+                   print_summary=True, T_rollout=None, T_rollout_clf=None, seed=None):
 
-    print_summary = True
     live_plot = False
     if make_plots:
-        clear_results()    
+        clear_results()
 
     safety = policy_filter(controller=controller,
                            h_controller=h_controller, 
@@ -77,7 +92,9 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                            noise_choice_cbf=rollout_noise_cbf,
                            noise_choice_clf=rollout_noise_clf,
                            include_h0=include_h0,
-                           include_v0=include_v0)
+                           include_v0=include_v0,
+                           T_rollout=T_rollout,
+                           T_rollout_clf=T_rollout_clf)
 
     backup_safety = backup_filter(policy_class=safety)
 
@@ -88,20 +105,23 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                           dt=safety.dt)
 
     valid_methods = {"rpcbf", "pclf", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
-    
+
     if method not in valid_methods:
         raise ValueError(f"Unknown method: {method}")
-    
-    # methods whose CLF is the worst-case cumulative cost V_max (P-CLF family)
+
     pclf_methods = {"pclf", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
-    cbf_methods = {"rpcbf", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
+    cbf_methods  = {"rpcbf", "pclf_rpcbf_qp", "two_step_pclf_pcbf", "pure_backup"}
     is_pclf = method in pclf_methods
-    x_s = np.array(x_s)
+    is_cbf  = method in cbf_methods
+
+    x_s_init = np.array(x_s, dtype=float)
+    x_s = np.array(x_s, dtype=float)
+    u_scale = np.array([safety.v_max, safety.om_max])      # normalization for effort: (v/v_max)^2 + (om/om_max)^2
+    dt = safety.dt
+
     trajectory_actual = [x_s.copy()]
     obs_log = [safety.obs_class.pos_now().copy()]     # (n_obs, 2) per step
     collision = None
-    u_effort = 0
-    cbf_effort = 0
     applied_u = []
     h_now_log = []
     h_hmax_log = []
@@ -110,10 +130,16 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
     delta_log = []
     v_dot_log = []
     alV_log = []
-    d_log = [] 
-    u_nom_log = []
-    u_effort_log = []
-    cbf_effort_log = []
+    d_log = []
+    u_nom_log = []      # reference the filter was measured against (CLF-filtered u for two-step)
+    interv_log = []     # ||u_act - u_ref|| >= inter_input
+    cbf_on_log = []     # CBF multiplier > 0 (backup: deviation flag)
+    effort_log = []     # per-step ||u_act/u_max||^2
+    dev_sq_log = []     # per-step ||(u_act - u_ref)/u_max||^2
+    J_u_log = []        # running integral of effort                     -> J_u(t)
+    J_int_log = []      # running integral of dev_sq over CBF-active steps -> J_int(t)
+    J_u = 0.0
+    J_int = 0.0
 
     if make_plots:
         X, Y, V = heatmap_V(safety, goal=init_goal, theta=x_s[2])
@@ -200,7 +226,7 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
             V_max_log.append(V_max)
 
         elif method == "None":
-            u_act=u_nom
+            u_act = u_nom
             solve_dt = 0.0
             intervening = "None"
             h_hmax, V, V_max, delta = 0.0, 0.0, 0.0, 0.0
@@ -212,14 +238,38 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                 f"(penetration {-clearance:.4f} m). Stopping simulation.")
             break
 
+        # ---- per-step effort / intervention bookkeeping -------------------------------------
+        u_act = np.asarray(u_act, dtype=float)
+        u_ref = np.asarray(u_ref, dtype=float)
+        effort_k = float(np.sum((u_act / u_scale)**2))                 # dimensionless, <= 2
+        dev_sq_k = float(np.sum(((u_act - u_ref) / u_scale)**2))       # dimensionless, <= 2
+        interv_k = (intervening is True)
+        if method == "pure_backup":
+            cbf_on_k = interv_k                                        # no QP multiplier available
+        elif is_cbf and len(safety.cbf_active_log) == kk + 1:
+            cbf_on_k = bool(safety.cbf_active_log[-1])                 # this step's CBF multiplier > 0
+        else:
+            cbf_on_k = False
+
+        J_u   += effort_k * dt                                          # exact for zero-order-hold inputs
+        J_int += dev_sq_k * dt if cbf_on_k else 0.0
+
+        effort_log.append(effort_k)
+        dev_sq_log.append(dev_sq_k)
+        interv_log.append(interv_k)
+        cbf_on_log.append(cbf_on_k)
+        J_u_log.append(J_u)
+        J_int_log.append(J_int)
+        # --------------------------------------------------------------------------------------
+
         x_s = safety.propagate(x=x_control, u=u_act, d=d_env, goal=goal)
         safety.obs_class.step()                       # obstacle moves with the same dt as the robot
 
-        u_nom_log.append(np.asarray(u_ref, dtype=float).copy())
+        u_nom_log.append(u_ref.copy())
         obs_log.append(safety.obs_class.pos_now().copy())
         trajectory_actual.append(x_s.copy())
-        applied_u.append(np.asarray(u_act).copy())
-        d_log.append(np.asarray(d_env).copy()) 
+        applied_u.append(u_act.copy())
+        d_log.append(np.asarray(d_env).copy())
 
         if print_summary:
             # last logged CBF row for this step, if this method has a CBF
@@ -234,7 +284,8 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
                                 "None": "None",
                                 "pclf_rpcbf_qp": "P-CBF-CLF value",
                                 "two_step_pclf_pcbf": "two_step P-CBF-CLF value"}.get(method, "CLF"),
-                    stop_step=h_stop, dt=safety.dt, hdot=hdot_k, alh=alh_k)
+                    stop_step=h_stop, dt=safety.dt, hdot=hdot_k, alh=alh_k,
+                    J_u=J_u, J_int=J_int if is_cbf else None, cbf_on=cbf_on_k)
 
         if np.linalg.norm(goal - x_s[:2]) < 0.05:
             print("Goal reached!")
@@ -248,9 +299,10 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
             print(f"QP stopped due to infeasibility at step {kk}")
             break
 
-    # Plotting
+    # ---- arrays ---------------------------------------------------------------------------
     trajectory_actual = np.asarray(trajectory_actual)
-    applied_u = np.asarray(applied_u)
+    applied_u = np.asarray(applied_u).reshape(-1, safety.dyn.nu)
+    u_nom_log = np.asarray(u_nom_log).reshape(-1, safety.dyn.nu)
     h_now_log = np.asarray(h_now_log)
     h_hmax_log = np.asarray(h_hmax_log)
     V_log = np.asarray(V_log)
@@ -265,29 +317,51 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
     obs_now = safety.obs_class.pos_now()
     obstacles = [(obs_now[i, 0], obs_now[i, 1], safety.obs_class.R_O[i]) for i in range(len(safety.obs_class.R_O))]
 
-    # Control effort and CBF intervention metrics
-    u_nom_log = np.asarray(u_nom_log)                 # (N, 2)
-    u_scale   = np.array([safety.v_max, safety.om_max])
-    dt        = safety.dt
-    effort = np.sum((applied_u / u_scale)**2, axis=1)
-    J_u    = dt * np.sum(effort)
-    print(f"Controller effort J_u = {J_u:.4f} s")
-    metrics = dict(J_u=J_u, J_int=np.nan, T_int=np.nan, frac=np.nan, peak=np.nan, ratio=np.nan)
+    effort_log = np.asarray(effort_log, dtype=float)
+    dev_sq_log = np.asarray(dev_sq_log, dtype=float)
+    interv_log = np.asarray(interv_log, dtype=bool)
+    cbf_on_log = np.asarray(cbf_on_log, dtype=bool)
+    J_u_log    = np.asarray(J_u_log, dtype=float)
+    J_int_log  = np.asarray(J_int_log, dtype=float)
+    N = len(applied_u)
+    T_run = N * dt
 
-    if method in cbf_methods and len(applied_u) > 0:
-        cbf_on = np.asarray(safety.cbf_active_log, dtype=bool)[:len(applied_u)]   # drop a trailing solve from a collision break
-        assert len(cbf_on) == len(applied_u), f"{len(cbf_on)} CBF solves vs {len(applied_u)} steps"
-        dev    = (applied_u - u_nom_log) / u_scale
-        dev_sq = np.sum(dev**2, axis=1)                   # (N,)
-        J_int = dt * np.sum(dev_sq[cbf_on])               # integrated CBF intervention, s
-        T_int = dt * np.sum(cbf_on)                       # CBF active time, s
-        frac  = T_int / (len(cbf_on) * dt)
-        peak  = np.sqrt(dev_sq[cbf_on].max()) if cbf_on.any() else 0.0
-        ratio = J_int / J_u if J_u > 0 else 0.0
-        metrics.update(J_int=J_int, T_int=T_int, frac=frac, peak=peak, ratio=ratio)
-        print(f"CBF intervention: J_int={J_int:.4f} s  ratio={ratio:.1%}  "
-            f"T_int={T_int:.2f} s ({frac:.1%} of run)  peak_dev={peak:.3f}")
+    # ---- scalar metrics ------------------------------------------------------------------
+    J_nom = dt * float(np.sum(np.sum((u_nom_log / u_scale)**2, axis=1))) if N else np.nan
+    metrics = dict(
+        J_u=J_u,                                   # integrated normalized control effort [s]
+        J_nom=J_nom,                               # effort the reference (nominal / CLF-filtered) alone would spend [s]
+        effort_increase=(J_u - J_nom) / J_nom if J_nom > 0 else np.nan,   # "filter raised effort by X%"
+        J_int=np.nan, T_int=np.nan, frac=np.nan, peak=np.nan,
+        J_u_active=np.nan, share_active=np.nan,
+        T_run=T_run, n_steps=N,
+        reached=bool(N and collision is None and np.linalg.norm(np.asarray(init_goal) - trajectory_actual[-1, :2]) < 0.05),
+        collision=collision is not None,
+        h_min=float(np.nanmin(h_now_log)) if h_now_log.size else np.nan,   # closest approach (h <= 0 safe)
+        n_infeasible=int(np.sum(np.isnan(hdot_log[:, 0]))) if hdot_log.size else 0,
+    )
+    print(f"Controller effort J_u = {J_u:.4f} s   (reference alone J_nom = {J_nom:.4f} s, "
+          f"increase {metrics['effort_increase']:+.1%})")
 
+    if is_cbf and N > 0:
+        T_int        = dt * float(np.sum(cbf_on_log))                        # filter-active time [s]
+        frac         = T_int / T_run
+        peak         = float(np.sqrt(dev_sq_log[cbf_on_log].max())) if cbf_on_log.any() else 0.0
+        J_u_active   = dt * float(np.sum(effort_log[cbf_on_log]))            # effort spent while filter active [s]
+        share_active = J_u_active / J_u if J_u > 0 else np.nan               # true fraction of J_u, in [0, 1]
+        metrics.update(J_int=J_int, T_int=T_int, frac=frac, peak=peak,
+                       J_u_active=J_u_active, share_active=share_active)
+        print(f"Filter intervention: J_int={J_int:.4f} s   active {T_int:.2f} s ({frac:.1%} of run)   "
+              f"effort during active {share_active:.1%} of J_u   peak_dev={peak:.3f}")
+
+    # ---- parameters this run used (for the Excel 'params' sheet) --------------------------
+    params = {**safety.params(),
+              "method": method, "var_slack": var_slack, "env_noise": env_noise,
+              "x0": list(map(float, x_s_init)), "goal": list(map(float, init_goal)),
+              "goal_dyn_op": goal_dyn_op, "goal_motion": goal_motion,
+              "det_collison": det_collison, "early_stop": early_stop}
+
+    # ---- plotting --------------------------------------------------------------------------
     if make_plots:
         plot_trajectories(states_list=trajectory_actual, inputs_list=applied_u, goal=init_goal,
                         obstacles=obstacles, dt=safety.dt, title=method.upper(), results_dir="plotter/Results")
@@ -333,14 +407,20 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
             if len(safety.tail_log) > 0:
                 tl = np.asarray(safety.tail_log)
                 print(f"[tail l(x_T)/l(x_0)] median {np.median(tl):.3f}  90% {np.percentile(tl,90):.3f}  max {tl.max():.3f}")
-    
-        if live_plot:    
+
+        if live_plot:
             plt.close("all")
             live_plot = live_plotter(obs_pos=obs_log[0], obs_radius=safety.obs_class.R_O)
             live_plot.update(trajectory=trajectory_actual, goal=init_goal, obs_traj=obs_log, pause=1e-5)
-        
-    return {"states": trajectory_actual, "inputs": applied_u, "u_nom": u_nom_log, 
+
+    return {"states": trajectory_actual, "inputs": applied_u, "u_nom": u_nom_log,
+            "t": np.arange(N) * dt,
+            # per-step effort / intervention series (all length N, aligned with inputs)
+            "effort": effort_log, "dev_sq": dev_sq_log,
+            "interv": interv_log, "cbf_on": cbf_on_log,
+            "J_u_run": J_u_log, "J_int_run": J_int_log,
             "metrics": metrics,
+            "params": params,
             "lam_cbf": np.asarray(safety.lam_cbf_log, dtype=float),
             "cbf_active": np.asarray(safety.cbf_active_log, dtype=bool),
             "h_now": h_now_log, "obs": obs_log,
@@ -351,14 +431,14 @@ def run_simulation(method, x_s, controller, h_controller ,v_controller, var_slac
             "ellT": np.asarray(safety.ellT_log, dtype=float),
             "cert_valid": np.asarray(safety.cert_valid_log, dtype=float),   # 1.0 / 0.0
             "collision": collision,
-            "d_env": np.asarray(d_log), 
+            "d_env": np.asarray(d_log),
             "safety": safety}
 
 if __name__ == "__main__":
 
     # *1 "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
     # *2 "rpcbf", "pclf", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
-   
+
     settings = {
         "method": "pclf_rpcbf_qp",        # *2
         "x_s": [1.0, 2.8, 0.0],           # initial position [x, y, yaw]
@@ -378,9 +458,11 @@ if __name__ == "__main__":
         "include_v0": True,
         "det_collison" : False,
         "make_plots"   : True,
-        "early_stop"   : 3000
+        "early_stop"   : 3000,
+        "print_summary": True,
+        "T_rollout": 1.0,
+        "T_rollout_clf": 3.0,
     }
 
-    results  = run_simulation(**settings)  
+    results  = run_simulation(**settings)
     save_results_to_excel({settings["controller"]: results}, settings)
-    
