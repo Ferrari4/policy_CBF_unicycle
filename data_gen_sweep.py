@@ -20,7 +20,7 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-from Main import run_simulation
+from run_sim import run_simulation
 from plotter.Save_results_sweep import save_sweep_result, extract_filter_params
 
 # ----------------------------------------------------------------------------- sweep definition

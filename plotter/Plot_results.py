@@ -29,13 +29,18 @@ def plot_h_history(h_now, h_hmax, dt, path=None):
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    viol = np.where(h_now.max(axis=1) < 0.0)[0]
+    # h_now is already sign-flipped here: h >= 0 safe, h < 0 inside an obstacle.
+    h_worst = h_now.min(axis=1)                     # closest obstacle at each step
+    viol = np.where(h_worst < 0.0)[0]
+    k_min = int(np.argmin(h_worst))
     if viol.size:
-        print(f"SAFETY VIOLATION: h < 0 at {viol.size} steps, "
-              f"first t = {viol[0] * dt:.2f}s, max h = {h_now.max():.4f}")
+        print(f"SAFETY VIOLATION: h < 0 at {viol.size} steps "
+              f"(t = {viol[0] * dt:.2f}s to {viol[-1] * dt:.2f}s), "
+              f"min h = {h_worst[k_min]:.2e} at t = {k_min * dt:.2f}s, "
+              f"obstacle {int(np.argmin(h_now[k_min]))}")
     else:
-        print(f"No violation. Closest approach: h_max = {h_now.max():.4f} "
-              f"(margin {-h_now.max():.4f})")
+        print(f"No violation. Closest approach: h_min = {h_worst[k_min]:.4f} "
+              f"at t = {k_min * dt:.2f}s")
         
 def plot_v_history(V_log, V_max_log, dt, path=None,
                    value_label="V(x_t)", title="instantaneous P-CLF value",
