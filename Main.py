@@ -51,7 +51,7 @@ class policy_filter:
         self.lam_cbf_log    = []   # (nh,) CBF multipliers per CBF solve
 
         # clf parameters
-        self.gamma = 1.0 # Unused
+        self.gamma = 0.3 # Hand drawn
         self.slack_weight = 100
         self.clf_exact_tail = True
         self.tail_log = []          # l(x_T) / l(x_0) per P-CLF solve: evidence for dropping the tail
@@ -212,19 +212,19 @@ class policy_filter:
         return self._noise_selection(self.noise_choice_clf, self.train_noise,
                                     self.horizon_clf if horizon is None else horizon, override)
 
-    def noise_single(self, env_noise, index):
+    def noise_single(self, env_noise, index, rng=None):
+        rng = self.env_rng if rng is None else rng
         if env_noise == "Uniform":
-            d_env = self.test_noise.uniform_test(rng=self.env_rng, scale=self.d_scale)
+            d_env = self.test_noise.uniform_test(rng=rng, scale=self.d_scale)
         elif env_noise == "Zero":
             d_env = self.test_noise.zero_test()
         elif env_noise == "BangBang":
-            d_env = self.test_noise.bangbang_test(rng=self.env_rng, k=index, 
+            d_env = self.test_noise.bangbang_test(rng=rng, k=index,
                                                   interval_size=self.interval_size, scale=self.d_scale)
         else:
             raise ValueError(f"Unknown environment noise: {env_noise}")
-
         return d_env
-
+    
     def propagate(self, x, u, d, goal):
         x_next = self.dyn.solve_ivp_fun(x0=x, d=d, goal=goal, u=u)
         x_next = np.asarray(x_next)
@@ -412,6 +412,90 @@ class policy_filter:
         solve_dt = time.perf_counter() - start_time
 
         return u_act, intervening, solve_dt, h_hmax, info["h_stop_step"]
+
+    def clf_qp(self, x, u_nom, goal, use_slack):
+        """Hand-drawn CLF (no preview)  +  RP-CBF, one QP.
+        CLF row:  grad_V (f + g u) <= -gamma V + delta."""
+        start_time = time.perf_counter()
+        
+        V = float(self.clf.clf_value(x, goal))                 # hand-drawn CLF
+        grad_V = np.asarray(self.clf.clf_value_gradient(x, goal), dtype=float).reshape(self.dyn.nx)
+        d_nom = np.zeros(self.dyn.nd)
+        f_x = self.dyn.f(x, d_nom)           
+        g_x = self.dyn.G(x, d_nom) 
+        rate = self.gamma * V                                  # exponential decrease rate
+
+        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
+        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
+        G, HG = self._finalize_constraints(G, HG, M.shape[0])
+
+        try:
+            u_act, intervening, delta = self._solve_qp(M, q, G, HG, u_nom, use_slack=use_slack)
+        except Exception as e:
+            print("QP failed:", e)
+            u_act = np.zeros(self.dyn.nu)
+            intervening = "infeasible"
+            delta = 0.0
+
+        solve_dt = time.perf_counter() - start_time
+
+        Vdot = np.nan
+        alV = np.nan
+        if intervening != "infeasible":
+            Vdot = float(grad_V @ (f_x + g_x @ u_act))
+            alV = -rate
+            assert Vdot <= alV + delta + 1e-7, (
+                f"CLF violated at Vdot={Vdot:.4f} > {alV + delta:.4f}")
+
+        return u_act, intervening, solve_dt, V, delta, Vdot, alV
+
+    def clf_rpcbf_qp(self, x, u_nom, goal, use_slack):
+        """Hand-drawn CLF (no preview)  +  RP-CBF, one QP.
+        CLF row:  grad_V (f + g u) <= -gamma V + delta."""
+        start_time = time.perf_counter()
+        h_hmax, _, grad_h, h_f, h_G, info_h = self.cert_batch.get_value_and_grad(x, self.noise_selection_cbf(),
+                                                                            goal, include_h0=self.include_h0)
+        dV_dt = info_h["dV_dt"]
+        self.dvdt_log.append(dV_dt.copy())
+
+        V = float(self.clf.clf_value(x, goal))                 # hand-drawn CLF
+        grad_V = np.asarray(self.clf.clf_value_gradient(x, goal), dtype=float).reshape(self.dyn.nx)
+        d_nom = np.zeros(self.dyn.nd)
+        f_x = self.dyn.f(x, d_nom)           
+        g_x = self.dyn.G(x, d_nom) 
+        rate = self.gamma * V                                  # exponential decrease rate
+
+        M, q, G, HG, pad = self._init_qp(u_nom, use_slack=use_slack)
+        self._add_clf_constraint(G, HG, V, grad_V, f_x, g_x, use_slack=use_slack, rate=rate)
+        self._add_cbf_constraints(G, HG, h_hmax, grad_h, h_f, h_G, pad, dV_dt)
+        G, HG = self._finalize_constraints(G, HG, M.shape[0])
+
+        try:
+            u_act, intervening, delta = self._solve_qp(M, q, G, HG, u_nom, use_slack=use_slack,
+                                                    n_cbf=len(h_hmax))
+        except Exception as e:
+            print("QP failed:", e)
+            u_act = np.zeros(self.dyn.nu)
+            intervening = "infeasible"
+            delta = 0.0
+            self.lam_cbf_log.append(np.full(self.cert.nh, np.nan))
+            self.cbf_active_log.append(False)
+
+        self._pcbf_terms(h_hmax, grad_h, h_f, h_G, dV_dt,
+                        None if intervening == "infeasible" else u_act)
+
+        solve_dt = time.perf_counter() - start_time
+
+        Vdot = np.nan
+        alV = np.nan
+        if intervening != "infeasible":
+            Vdot = float(grad_V @ (f_x + g_x @ u_act))
+            alV = -rate
+            assert Vdot <= alV + delta + 1e-7, (
+                f"CLF violated at Vdot={Vdot:.4f} > {alV + delta:.4f}")
+
+        return u_act, intervening, solve_dt, V, delta, h_hmax, Vdot, alV
+
 
     def pclf_qp(self, x, u_nom, goal ,use_slack):
         start_time = time.perf_counter()

@@ -104,13 +104,13 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
                           init_goal=init_goal,
                           dt=safety.dt)
 
-    valid_methods = {"rpcbf", "pclf", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
+    valid_methods = {"rpcbf", "pclf", "clf_qp", "clf_rpcbf_qp", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
 
     if method not in valid_methods:
         raise ValueError(f"Unknown method: {method}")
 
     pclf_methods = {"pclf", "pclf_rpcbf_qp", "two_step_pclf_pcbf"}
-    cbf_methods  = {"rpcbf", "pclf_rpcbf_qp", "two_step_pclf_pcbf", "pure_backup"}
+    cbf_methods  = {"rpcbf", "pclf_rpcbf_qp", "two_step_pclf_pcbf", "pure_backup", "clf_rpcbf_qp"}
     is_pclf = method in pclf_methods
     is_cbf  = method in cbf_methods
 
@@ -185,6 +185,32 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
             alV_log.append(alV)
             delta_log.append(delta if intervening != "infeasible" else np.nan)
 
+        elif method == "clf_qp":
+            u_act, intervening, solve_dt, V, delta, Vdot, alV = safety.clf_qp(x=x_control, 
+                                                                              u_nom=u_nom, 
+                                                                              goal=goal, 
+                                                                              use_slack=var_slack)
+            V_max = V                                   # no preview: the QP acts on V directly
+            V_log.append(V)
+            V_max_log.append(V_max)
+            v_dot_log.append(Vdot)
+            alV_log.append(alV)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
+
+        elif method == "clf_rpcbf_qp":
+            u_act, intervening, solve_dt, V, delta, h_hmax, Vdot, alV  = safety.clf_rpcbf_qp(x=x_control,
+                                                                                            u_nom=u_nom,
+                                                                                            goal=goal,
+                                                                                            use_slack=var_slack)
+            V_max = V                                   # no preview: the QP acts on V directly
+            h_now_log.append(safety.cert.h_function(x_control))
+            h_hmax_log.append(h_hmax)
+            V_log.append(V)
+            V_max_log.append(V_max)
+            v_dot_log.append(Vdot)
+            alV_log.append(alV)
+            delta_log.append(delta if intervening != "infeasible" else np.nan)
+
         elif method == "pclf_rpcbf_qp":
             u_act, intervening, solve_dt, V_max, delta, h_hmax, Vdot, alV, V = safety.pclf_rpcbf_qp(x=x_control,
                                                                                                    u_nom=u_nom,
@@ -212,7 +238,7 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
             delta_log.append(delta if intervening != "infeasible" else np.nan)
 
         elif method == "pure_backup":
-            d_new = safety.noise_single(env_noise, kk)
+            d_new = safety.noise_single(rollout_noise_cbf, kk, rng=safety.rng)
             u_act, intervening, solve_dt = backup_safety.safety_Bcbf(x=x_control,
                                                                      u_nom=u_nom, 
                                                                      d_nom=d_new)
@@ -234,8 +260,9 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
         hit, clearance, j = check_collision(x_s, safety.obs_class, robot_radius=0.0)
         if hit and det_collison:
             collision = dict(step=kk, t=kk * safety.dt, obstacle=j, clearance=clearance, state=x_s.copy())
-            print(f"COLLISION at t = {kk*safety.dt:.2f}s with obstacle {j} "
-                f"(penetration {-clearance:.4f} m). Stopping simulation.")
+            if print_summary:
+                print(f"COLLISION at t = {kk*safety.dt:.2f}s with obstacle {j} "
+                    f"(penetration {-clearance:.4f} m). Stopping simulation.")
             break
 
         # ---- per-step effort / intervention bookkeeping -------------------------------------
@@ -288,15 +315,18 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
                     J_u=J_u, J_int=J_int if is_cbf else None, cbf_on=cbf_on_k)
 
         if np.linalg.norm(goal - x_s[:2]) < 0.05:
-            print("Goal reached!")
+            if print_summary:
+                print("Goal reached!")
             break
 
         if kk >= early_stop:
-            print(f"Early stop at step:{kk}")
+            if print_summary:
+                print(f"Early stop at step:{kk}")
             break
 
         if intervening == "infeasible":
-            print(f"QP stopped due to infeasibility at step {kk}")
+            if print_summary:
+                print(f"QP stopped due to infeasibility at step {kk}")
             break
 
     # ---- arrays ---------------------------------------------------------------------------
@@ -340,7 +370,8 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
         h_min=float(np.nanmin(h_now_log)) if h_now_log.size else np.nan,   # closest approach (h <= 0 safe)
         n_infeasible=int(np.sum(np.isnan(hdot_log[:, 0]))) if hdot_log.size else 0,
     )
-    print(f"Controller effort J_u = {J_u:.4f} s   (reference alone J_nom = {J_nom:.4f} s, "
+    if print_summary:
+        print(f"Controller effort J_u = {J_u:.4f} s   (reference alone J_nom = {J_nom:.4f} s, "
           f"increase {metrics['effort_increase']:+.1%})")
 
     if is_cbf and N > 0:
@@ -351,7 +382,8 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
         share_active = J_u_active / J_u if J_u > 0 else np.nan               # true fraction of J_u, in [0, 1]
         metrics.update(J_int=J_int, T_int=T_int, frac=frac, peak=peak,
                        J_u_active=J_u_active, share_active=share_active)
-        print(f"Filter intervention: J_int={J_int:.4f} s   active {T_int:.2f} s ({frac:.1%} of run)   "
+        if print_summary:
+            print(f"Filter intervention: J_int={J_int:.4f} s   active {T_int:.2f} s ({frac:.1%} of run)   "
               f"effort during active {share_active:.1%} of J_u   peak_dev={peak:.3f}")
 
     # ---- parameters this run used (for the Excel 'params' sheet) --------------------------
@@ -406,7 +438,8 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
                                 ellT_log=safety.ellT_log or None)
             if len(safety.tail_log) > 0:
                 tl = np.asarray(safety.tail_log)
-                print(f"[tail l(x_T)/l(x_0)] median {np.median(tl):.3f}  90% {np.percentile(tl,90):.3f}  max {tl.max():.3f}")
+                if print_summary:
+                    print(f"[tail l(x_T)/l(x_0)] median {np.median(tl):.3f}  90% {np.percentile(tl,90):.3f}  max {tl.max():.3f}")
 
         if live_plot:
             plt.close("all")
@@ -437,12 +470,12 @@ def run_simulation(method, x_s, controller, h_controller, v_controller, var_slac
 if __name__ == "__main__":
 
     # *1 "proportional_policy" or "random_policy" or "constant_policy" or "backup_policy"
-    # *2 "rpcbf", "pclf", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf"
+    # *2 "rpcbf", "pclf", "pure_backup", "None", "pclf_rpcbf_qp", "two_step_pclf_pcbf", "clf_rpcbf_qp"
 
     settings = {
-        "method": "pclf_rpcbf_qp",        # *2
+        "method": "clf_rpcbf_qp",        # *2
         "x_s": [1.0, 2.8, 0.0],           # initial position [x, y, yaw]
-        "controller": "constant_policy",  # "clf_nom" or *1
+        "controller": "proportional_policy",  # "clf_nom" or *1
         "h_controller": "backup_policy",       # *1
         "v_controller": "proportional_policy", # *1
         "var_slack": True,
@@ -458,9 +491,9 @@ if __name__ == "__main__":
         "include_v0": True,
         "det_collison" : False,
         "make_plots"   : True,
-        "early_stop"   : 3000,
+        "early_stop"   : 4000,
         "print_summary": True,
-        "T_rollout": 1.0,
+        "T_rollout": 1.5,
         "T_rollout_clf": 3.0,
     }
 

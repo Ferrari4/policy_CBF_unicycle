@@ -14,6 +14,8 @@ class v_certificate:
         self.rho_margin = rho_margin    # influence radius = R_O + rho_margin
         self.k_obs      = k_obs
         self.a_obs      = a_obs
+        self.k1 = 1.0
+        self.c0 = 0.3
 
     def get_params(self, x, goal): # Batch ready
         x, goal = np.asarray(x), np.asarray(goal)
@@ -25,28 +27,24 @@ class v_certificate:
                                np.cos(theta_goal - theta))
         return dx, dy, d, theta_err
 
-    def clf_value(self, x, goal): # Should not be Batched since a Valid CLF is not previewd
-        x = self.sys_dynm.chk_x(x) 
+    def clf_value(self, x, goal):
+        x = self.sys_dynm.chk_x(x)
         _, _, d, theta_err = self.get_params(x, goal)
-        V = d**2 * (0.5 + self.k * (1.0 - np.cos(theta_err))) # CLF
-        return V
+        h = 2.0 * (1.0 - np.cos(0.5 * theta_err))
+        return 0.5 * d**2 + self.k1 * (self.c0 + d) * h
 
-    def clf_value_gradient(self, x, goal): # Should not be Batched since a Valid CLF is not previewd
-        x = self.sys_dynm.chk_x(x) 
+    def clf_value_gradient(self, x, goal):
+        x = self.sys_dynm.chk_x(x)
         dx, dy, d, theta_err = self.get_params(x, goal)
-        sin_err = np.sin(theta_err)
-        cos_err = np.cos(theta_err)
-        A = 0.5 + self.k * (1.0 - cos_err)
-        # Analytical gradient
-        dV_dpx = 2.0 * dx * A - self.k * dy * sin_err
-        dV_dpy = 2.0 * dy * A + self.k * dx * sin_err
-        dV_dtheta = -self.k * (d**2) * sin_err
-        grad_V = np.array([
-            dV_dpx,
-            dV_dpy,
-            dV_dtheta
-        ])
-        return grad_V
+        h = 2.0 * (1.0 - np.cos(0.5 * theta_err))
+        hp = np.sin(0.5 * theta_err)                     # dh/dtheta_err
+        dd = max(d, 1e-9)                                # guard d -> 0
+        w  = self.k1 * (self.c0 + d)
+        # d(theta_err)/dp = (-dy, dx)/d^2 ,  d(theta_err)/dtheta = -1
+        dV_dpx = dx + self.k1 * h * dx / dd - w * hp * dy / dd**2
+        dV_dpy = dy + self.k1 * h * dy / dd + w * hp * dx / dd**2
+        dV_dtheta = -w * hp
+        return np.array([dV_dpx, dV_dpy, dV_dtheta])
 
     def clf_certificate(self, x, goal, k=None): # Batch ready
         k = self.k if k is None else k

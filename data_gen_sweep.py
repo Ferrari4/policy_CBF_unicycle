@@ -1,15 +1,19 @@
 """
 Disturbance sweep for the P-CLF unicycle.
 
-Batches (each = 5 circles x 18 start points = 90 runs):
-    method="pclf" x controller in {proportional, backup, constant} x env_noise in {Uniform, BangBang}
-    method="None" x controller=proportional (benchmark)         x env_noise in {Uniform, BangBang}
--> 8 batches, 720 runs.  Rollout noise (CBF and CLF) always matches env noise.
+Batches (each = len(RADII) circles x N_PER_CIRCLE start points):
+    method="pclf" x controller in {proportional, backup, constant} x env_noise in ENV_NOISES
+    method="None" x controller=proportional (benchmark)         x env_noise in ENV_NOISES
+Rollout noise is fixed in BASE_SETTINGS (CLF preview on nominal rollouts, rollout_noise_clf="Zero";
+CBF preview rollout_noise_cbf="Uniform"); the environment disturbance is env_noise.
 
 Start points: equidistant circles of radius R around the goal, restricted to x >= 0, y >= 0,
-heading facing the goal.  Each batch gets its own folder, e.g.  sweep_results/pclf_uniform_backup_90/
-containing manifest.csv (start points), summary.csv (one row per run: settings + metrics),
-and the per-run files written by save_sweep_result.
+heading facing the goal.  Each batch gets its own folder, e.g.  sweep_results_pclf/pclf_bangbang_backup_250/
+containing manifest.csv (start points), params.csv (filter parameters), summary.csv (one row per run:
+settings + metrics), and the per-run files written by save_sweep_result.
+
+Failures are isolated per run: a simulation error writes FAILED_run_XXX.txt, a per-run save error writes
+FAILED_save_run_XXX.txt (the run's summary row is still kept).  Neither stops the sweep.
 """
 import os
 # one BLAS thread per worker process; must be set before numpy is imported anywhere
@@ -28,21 +32,22 @@ from plotter.Save_results_sweep import save_sweep_result
 # ----------------------------------------------------------------------------- sweep definition
 GOAL = np.array([4.0, 1.0])
 RADII = [0.5, 1.0, 2.0, 3.0, 4.0]
-N_PER_CIRCLE = 18
-ENV_NOISES = ["Uniform", "BangBang"]
+N_PER_CIRCLE = 50
+ENV_NOISES = ["BangBang"]
 CONTROLLER_SETS = [                      # (method, controller)
-    ("pclf", "proportional_policy"),
-    ("pclf", "backup_policy"),
-    ("pclf", "constant_policy"),
-    ("None", "proportional_policy"),     # benchmark
+    ("two_step_pclf_pcbf", "proportional_policy"),
+    ("two_step_pclf_pcbf", "backup_policy"),
+    ("two_step_pclf_pcbf", "constant_policy"),
+    ("pure_backup", "proportional_policy"),     # benchmark
     # CBF-intervention comparison (Table 1 of the plan) - uncomment to include:
     # ("rpcbf",              "proportional_policy"),
+    # ("clf_rpcbf_qp",       "proportional_policy"),
     # ("pclf_rpcbf_qp",      "proportional_policy"),
     # ("two_step_pclf_pcbf", "proportional_policy"),
     # ("pure_backup",        "proportional_policy"),
 ]
-ROOT_DIR = "sweep_results"
-WORKERS = 40
+ROOT_DIR = "sweep_results_pclf_rpcbf_two"
+WORKERS = 22
 
 BASE_SETTINGS = {
     "method": "pclf",
@@ -50,8 +55,8 @@ BASE_SETTINGS = {
     "controller": "proportional_policy",
     "h_controller": "backup_policy",
     "v_controller": "proportional_policy",
-    "var_slack": False,
-    "rollout_noise_cbf": "Zero",
+    "var_slack": True,
+    "rollout_noise_cbf": "Uniform",
     "rollout_noise_clf": "Zero",
     "env_noise": "Zero",
     "no_obs": "single",
@@ -65,8 +70,8 @@ BASE_SETTINGS = {
     "make_plots": False,
     "early_stop": 4000,        # 40 s at dt = 0.01
     "print_summary": False,    # no per-step console output inside the pool
-    "T_rollout": None,         # None -> policy_filter defaults (1.5 s CBF, 3.0 s CLF)
-    "T_rollout_clf": None,
+    "T_rollout": 1.5,          # None -> policy_filter defaults (1.5 s CBF, 3.0 s CLF)
+    "T_rollout_clf": 3.0,
 }
 
 # columns of summary.csv: job info + the settings that vary + every metric from run_simulation
@@ -119,8 +124,6 @@ def build_jobs():
                         **BASE_SETTINGS,
                         "method": method,
                         "controller": controller,
-                        "rollout_noise_cbf": env_noise,    # match the environment
-                        "rollout_noise_clf": env_noise,
                         "env_noise": env_noise,
                         "x_s": x_s,
                     }
@@ -132,11 +135,13 @@ def build_jobs():
 
 # ----------------------------------------------------------------------------- worker
 def _scalar(v):
-    """csv-safe scalar."""
+    """Excel/csv-safe scalar: sequences -> 'a,b,c' string, numpy scalars -> python, dicts -> str."""
     if isinstance(v, (list, tuple, np.ndarray)):
         return ",".join(f"{float(x):.6g}" for x in np.asarray(v).ravel())
     if isinstance(v, np.generic):
         return v.item()
+    if isinstance(v, dict):
+        return str(v)
     return v
 
 
@@ -144,8 +149,10 @@ def run_one(job):
     try:
         results = run_simulation(**job["settings"])
         # drop the policy_filter object: results["params"] already holds every scalar setting
-        # (pickling the object back through the pool 720 times is slow and unnecessary)
+        # (pickling the object back through the pool hundreds of times is slow and unnecessary)
         results.pop("safety", None)
+        # make every parameter a plain scalar/string so no writer downstream can choke on a list
+        results["params"] = {k: _scalar(v) for k, v in results.get("params", {}).items()}
         return job, results, None
     except Exception:
         return job, None, traceback.format_exc()
@@ -176,6 +183,14 @@ def write_summary(out_dir, rows):
         w.writerows(rows)
 
 
+def write_params(out_dir, params):
+    with open(os.path.join(out_dir, "params.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["parameter", "value"])
+        for k, v in params.items():
+            w.writerow([k, _scalar(v)])
+
+
 # ----------------------------------------------------------------------------- main
 if __name__ == "__main__":
     jobs = build_jobs()
@@ -197,7 +212,8 @@ if __name__ == "__main__":
                             s["method"], s["controller"], s["env_noise"],
                             s["rollout_noise_cbf"], s["rollout_noise_clf"]])
 
-    failures = []
+    sim_failures = []          # (batch, run_id): run_simulation raised -> no data for this run
+    save_failures = []         # (batch, run_id): save_sweep_result raised -> summary row kept, per-run file missing
     summaries = {b: [] for b in batches}
     params_written = set()
 
@@ -209,35 +225,55 @@ if __name__ == "__main__":
             for fut in as_completed(pending):
                 job, results, err = fut.result()
                 out_dir = os.path.join(ROOT_DIR, job["batch"])
+                rid = job["run_id"]
+
                 if err is not None:
-                    failures.append((job["batch"], job["run_id"], err))
-                    with open(os.path.join(out_dir, f"FAILED_run_{job['run_id']:03d}.txt"), "w") as f:
+                    sim_failures.append((job["batch"], rid))
+                    with open(os.path.join(out_dir, f"FAILED_run_{rid:03d}.txt"), "w") as f:
                         f.write(err)
-                else:
-                    filter_params = results.get("params", {})
-                    save_sweep_result(results, job["settings"], out_dir, job["run_id"],
+                    bar.update(1)
+                    continue
+
+                # 1) summary row first: it only needs results["metrics"], so it survives a save failure
+                try:
+                    summaries[job["batch"]].append(summary_row(job, results))
+                except Exception:
+                    with open(os.path.join(out_dir, f"FAILED_summary_run_{rid:03d}.txt"), "w") as f:
+                        f.write(traceback.format_exc())
+
+                # 2) per-run file; isolated so one bad value cannot kill the sweep
+                filter_params = results.get("params", {})
+                try:
+                    save_sweep_result(results, job["settings"], out_dir, rid,
                                       job_meta={"circle": job["circle"], "radius": job["radius"],
                                                 "point": job["point"]},
                                       filter_params=filter_params)
-                    summaries[job["batch"]].append(summary_row(job, results))
+                except Exception:
+                    save_failures.append((job["batch"], rid))
+                    with open(os.path.join(out_dir, f"FAILED_save_run_{rid:03d}.txt"), "w") as f:
+                        f.write(traceback.format_exc())
 
-                    # one params.csv per batch (settings shared by every run in the batch)
-                    if job["batch"] not in params_written and filter_params:
-                        with open(os.path.join(out_dir, "params.csv"), "w", newline="") as f:
-                            w = csv.writer(f)
-                            w.writerow(["parameter", "value"])
-                            for k, v in filter_params.items():
-                                w.writerow([k, _scalar(v)])
+                # 3) one params.csv per batch (settings shared by every run in the batch)
+                if job["batch"] not in params_written and filter_params:
+                    try:
+                        write_params(out_dir, filter_params)
                         params_written.add(job["batch"])
-                    del results
+                    except Exception:
+                        with open(os.path.join(out_dir, "FAILED_params.txt"), "w") as f:
+                            f.write(traceback.format_exc())
+
+                del results
                 bar.update(1)
 
     for b, rows in summaries.items():
         write_summary(os.path.join(ROOT_DIR, b), rows)
 
-    print(f"done. {len(jobs) - len(failures)} ok, {len(failures)} failed")
-    for b, rid, _ in failures:
-        print(f"  FAILED {b} run {rid}")
+    n_ok = len(jobs) - len(sim_failures)
+    print(f"done. {n_ok} simulated, {len(sim_failures)} simulation failures, {len(save_failures)} save failures")
+    for b, rid in sim_failures:
+        print(f"  FAILED sim  {b} run {rid}")
+    for b, rid in save_failures:
+        print(f"  FAILED save {b} run {rid}  (summary row kept)")
 
     # quick batch-level readout
     for b, rows in summaries.items():
